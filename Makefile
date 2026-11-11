@@ -40,7 +40,6 @@ $(SHIM): $(AGENT_DIR)/badcpu_shim.c
 	$(CC) -O2 -fPIC -shared -o $@ $<
 	@echo "built $@"
 
-shim: $(SHIM)
 
 
 # the shim that replaces Sober's libbadcpu.so
