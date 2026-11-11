@@ -27,6 +27,7 @@ from pathlib import Path
 APP_ID = "org.vinegarhq.Sober"
 REPO = Path(__file__).resolve().parents[2]
 AGENT_BUILD = REPO / "build" / "wieen_agent.so"
+COMPILER = REPO / "build" / "wieen-compile"
 
 
 def app_dir() -> Path:
@@ -90,11 +91,27 @@ class Agent:
             buf += chunk
         return buf
 
+    def compile(self, source: str) -> bytes:
+        """Compile the snippet into Luau bytecode.
+
+        The client only ships the Luau VM, not the compiler, so the
+        bytecode is produced here and the agent loads it with the
+        client's own luau_load.
+        """
+        if not COMPILER.exists():
+            raise FileNotFoundError(f"compiler not built: {COMPILER} (run: make compile)")
+        proc = subprocess.run([str(COMPILER), "-"], input=source.encode(),
+                              capture_output=True)
+        if proc.returncode != 0 or not proc.stdout:
+            raise RuntimeError(proc.stderr.decode(errors="replace").strip()
+                               or "compilation failed")
+        return proc.stdout
+
     def exec(self, source: str) -> str:
         if self.sock is None and not self.connect():
             raise ConnectionError(f"no agent at {self.path}")
         assert self.sock is not None
-        payload = source.encode()
+        payload = self.compile(source)
         self.sock.sendall(struct.pack("<I", len(payload)) + payload)
         (length,) = struct.unpack("<I", self._recv_exact(4))
         return self._recv_exact(length).decode(errors="replace")
