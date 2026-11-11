@@ -3,3 +3,4 @@ work/
 *.o
 *.so
 !src/**/*.c
+__pycache__/
