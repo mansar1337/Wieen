@@ -41,7 +41,6 @@ WANTED = {
     "_Z10lua_settopP9lua_Statei": "API_LUA_SETTOP",
     "_Z13lua_tolstringP9lua_StateiPm": "API_LUA_TOLSTRING",
     "_Z8lua_typeP9lua_Statei": "API_LUA_TYPE",
-    "_Z12lua_mainthreadP9lua_State": "API_LUA_MAINTHREAD",
     "_Z12luau_executeP9lua_State": "API_LUA_EXECUTE",
     "_ZL12luau_executeILb0EEvP9lua_State": "API_LUA_INTERPRETER",
 }
