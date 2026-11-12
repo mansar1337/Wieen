@@ -50,6 +50,10 @@ SNIPPETS = [
     ("nested table", "local t = {a = {b = {c = 42}}} return t.a.b.c"),
     ("unary minus", "return -5"),
     ("multiple returns", "local function f() return 1, 2 end return select(2, f())"),
+    ("wait", 'wait() return "waited"'),
+    ("wait with time", 'wait(0.1) return "waited"'),
+    ("task wait", 'task.wait() return "waited"'),
+    ("wait in loop", 'for i = 1, 3 do wait() end return "looped"'),
     ("error", "error(\"boom\")"),
 ]
 

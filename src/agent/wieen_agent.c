@@ -181,7 +181,7 @@ struct maprange
     unsigned long hi;
 };
 
-static struct maprange g_maps[512];
+static struct maprange g_maps[1024];
 static int g_mapcount;
 
 static void refresh_maps(void)
@@ -204,13 +204,33 @@ static void refresh_maps(void)
     fclose(f);
 }
 
-static int is_mapped(void* p)
+static int map_contains(void* p)
 {
     unsigned long a = (unsigned long)p;
     for (int i = 0; i < g_mapcount; i++)
         if (a >= g_maps[i].lo && a < g_maps[i].hi)
             return 1;
     return 0;
+}
+
+static int is_mapped(void* p)
+{
+    if (map_contains(p))
+        return 1;
+
+    /*
+     * The map is a snapshot, and the client keeps growing its heap, so
+     * regions that came up after the snapshot was taken are unknown.
+     * Reading the map again is cheap, but it is done only every now and
+     * then: the hook fires thousands of times a second.
+     */
+    static int misses;
+    if (++misses < 64)
+        return 0;
+
+    misses = 0;
+    refresh_maps();
+    return map_contains(p);
 }
 
 /*
@@ -354,11 +374,30 @@ static void run_pending(void* parent)
             *(void**)((char*)global + LSTATE_DEBUGSTEP) = 0;
             wieen_log("wieen: debugstep hook was %p\n", hook);
 
-            status = g_resume(thread, 0, 0);
+            /*
+             * A script that yields (wait(), task.wait()) is resumed right
+             * away: the game has no scheduler for a thread of ours, and a
+             * script that waits for a moment is what we want to run to
+             * the end anyway.
+             */
+            int resumes = 0;
+            for (;;)
+            {
+                status = g_resume(thread, 0, 0);
+                if (status != 1)
+                    break;
+                if (++resumes > 10000)
+                {
+                    status = -1;
+                    message = "the script yields over and over";
+                    break;
+                }
+            }
 
             *(void**)((char*)global + LSTATE_DEBUGSTEP) = hook;
-            wieen_log("wieen: lua_resume returned %d, status=%d\n",
-                      status, *(unsigned char*)((char*)thread + LSTATE_STATUS));
+            wieen_log("wieen: lua_resume returned %d, status=%d, resumes=%d\n",
+                      status, *(unsigned char*)((char*)thread + LSTATE_STATUS),
+                      resumes);
         }
         wieen_log("wieen: reading result\n");
         message = g_tolstring(thread, -1, &messagelen);
