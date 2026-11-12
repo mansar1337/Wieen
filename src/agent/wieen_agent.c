@@ -35,8 +35,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SOCKET_PATH "/home/xendr4x/.var/app/org.vinegarhq.Sober/data/wieen/wieen.sock"
-#define LOG_PATH "/home/xendr4x/.var/app/org.vinegarhq.Sober/data/wieen/agent.log"
+#define LOG_DIR_SUFFIX "/.var/app/org.vinegarhq.Sober/data/wieen"
+#define LOG_FILE_NAME "agent.log"
+#define SOCKET_FILE_NAME "wieen.sock"
 
 #define MAX_MESSAGE (64 * 1024)
 
@@ -134,9 +135,22 @@ static unsigned long g_base;
 /* logging                                                            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The agent runs inside the sandbox of Sober, and HOME there is the home
+ * of the user, so the paths of the socket and the log are written down
+ * once, from HOME.
+ */
+static void wieen_path(char* out, size_t cap, const char* name)
+{
+    const char* home = getenv("HOME");
+    snprintf(out, cap, "%s%s/%s", home && *home ? home : "/tmp", LOG_DIR_SUFFIX, name);
+}
+
 static void wieen_log(const char* fmt, ...)
 {
-    FILE* f = fopen(LOG_PATH, "a");
+    char path[512];
+    wieen_path(path, sizeof(path), LOG_FILE_NAME);
+    FILE* f = fopen(path, "a");
     if (!f)
         return;
     va_list ap;
@@ -159,12 +173,23 @@ static int g_pending_ready;
 static int g_finished;
 static char g_result[MAX_MESSAGE];
 static size_t g_result_len;
-static volatile int g_in_hook;
+static __thread int g_in_hook;
 
 /* ------------------------------------------------------------------ */
 /* the hook                                                           */
 /* ------------------------------------------------------------------ */
 
+/*
+ * An environment variable counts as a request only when it says something:
+ * an empty value, which a flatpak override leaves behind, means nothing.
+ */
+static int env_flag(const char* name)
+{
+    const char* v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+static unsigned long g_hits;
 static void* g_trampoline;
 static void wieen_on_resume(void* L, void* from, long nargs);
 static void (*g_handler)(void*, void*, long) = wieen_on_resume;
@@ -248,57 +273,25 @@ static int is_mapped(void* p)
 }
 
 /*
- * The client runs more than one Luau VM, and they do not necessarily
- * have the same layout, so a state is only used when it really looks
- * like one: the state itself is mapped, it points at a global state, and
- * the stack of the state is a pair of pointers into the same array.
- */
-/*
- * The client keeps growing its heap, so the map of memory is a snapshot
- * that goes out of date; a state of the game can be in a region the
- * snapshot does not know about.  The state comes from lua_resume, so it
- * is a real one even then, and the checks that matter are the ones on
- * the state itself.
+ * The state comes from lua_resume, so it is a real one.  The checks below
+ * are the ones that cost nothing and still catch a state of another VM
+ * with another layout: the pointers have to be there, aligned, and the
+ * stack has to be a sane list of slots.
  */
 static int state_is_usable(void* L)
 {
     if (!L || ((unsigned long)L & 7) != 0)
         return 0;
 
-    int known = is_mapped(L);
-    if (!known)
-    {
-        /*
-         * The map of memory may be out of date: the client grows its heap
-         * while it loads a place.  The state comes from lua_resume, so it
-         * is a real one even when the map does not say so.
-         */
-        refresh_maps();
-        known = is_mapped(L);
-        if (!known)
-        {
-            static int warned;
-            if (!warned)
-            {
-                warned = 1;
-                wieen_log("wieen: the state %p is not in the map of memory, "
-                          "trusting the hook\n", L);
-            }
-            known = 2;
-        }
-    }
-
     void* global = *(void**)((char*)L + LSTATE_GLOBAL);
-    if (!global)
-        return 0;
-    if (known == 1 && !is_mapped(global))
+    if (!global || ((unsigned long)global & 7) != 0)
         return 0;
 
     char* base = *(char**)((char*)L + LSTATE_BASE);
     char* top = *(char**)((char*)L + LSTATE_TOP);
     if (!base || !top)
         return 0;
-    if (known == 1 && (!is_mapped(base) || !is_mapped(top)))
+    if ((unsigned long)base < 0x10000 || (unsigned long)top < 0x10000)
         return 0;
     if (top < base)
         return 0;
@@ -379,6 +372,7 @@ static void run_pending(void* parent)
     const char* message = 0;
     size_t messagelen = 0;
     int status = -1;
+    wieen_log("wieen: running a script after %lu calls of lua_resume\n", g_hits);
     wieen_log("wieen: creating thread for %lu bytes in parent %p\n",
               (unsigned long)bclen, parent);
     void* thread = g_newthread(parent);
@@ -418,7 +412,13 @@ static void run_pending(void* parent)
             int resumes = 0;
             for (;;)
             {
-                status = g_resume(thread, 0, 0);
+                /*
+                 * The parent is the state that called lua_resume, so it is
+                 * the one the depth of the C stack is read from: a script
+                 * that recurses deeply must not walk past the stack of the
+                 * game.
+                 */
+                status = g_resume(thread, parent, 0);
                 if (status != 1)
                     break;
                 if (++resumes > 10000)
@@ -508,20 +508,29 @@ static void run_pending(void* parent)
     *(char**)((char*)parent + LSTATE_TOP) = saved_top;
 }
 
-static volatile int g_hits;
-
+/*
+ * The hook fires thousands of times a second, so a call that finds nothing
+ * to run has to cost almost nothing: no lock, no reading of the state, no
+ * file.  Everything that is expensive happens only when a script waits.
+ */
 static void wieen_on_resume(void* L, void* from, long nargs)
 {
+    /*
+     * One counter, so the log says how busy the hook is: a fault that
+     * arrives after a fixed number of calls and one that arrives after a
+     * fixed time are two different things.
+     */
+    if ((__atomic_add_fetch(&g_hits, 1, __ATOMIC_RELAXED) & 0x3FFFF) == 0)
+        wieen_log("wieen: lua_resume hit %lu\n", g_hits);
+
+    if (!__atomic_load_n(&g_pending_ready, __ATOMIC_RELAXED))
+        return;
     if (g_in_hook)
         return;
     g_in_hook = 1;
-    g_hits++;
-    if (g_hits <= 8 || (g_hits % 200) == 0)
-        wieen_log("wieen: lua_resume hit %d, L=%p from=%p nargs=%ld\n",
-                  g_hits, L, from, nargs);
     if (state_is_usable(L))
         run_pending(L);
-    else if (g_hits <= 8 || (g_hits % 200) == 0)
+    else
         wieen_log("wieen: that state does not look like a Luau state (%s), skipping\n",
                   state_problem(L));
     g_in_hook = 0;
@@ -531,14 +540,55 @@ static void wieen_on_resume(void* L, void* from, long nargs)
 /* a crash handler, so a fault inside the game says where it happened */
 /* ------------------------------------------------------------------ */
 
-static void (*g_old_segv)(int, siginfo_t*, void*);
+static const int g_fault_signal[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE};
+#define WIEEN_FAULTS ((int)(sizeof(g_fault_signal) / sizeof(g_fault_signal[0])))
 static int g_crashed;
+
+static void wieen_crash(int sig, siginfo_t* info, void* uc);
+static struct sigaction g_old_action[WIEEN_FAULTS];
 
 static void wieen_crash(int sig, siginfo_t* info, void* uc)
 {
+    /*
+     * The fault is not ours to swallow, and this handler runs on whatever
+     * thread the signal landed on, possibly in the middle of malloc: the
+     * very first thing is therefore to give the signal back to whoever
+     * asked for it, without touching anything.
+     */
+    for (int i = 0; i < WIEEN_FAULTS; i++)
+    {
+        if (g_fault_signal[i] != sig)
+            continue;
+        struct sigaction* old = &g_old_action[i];
+        if (old->sa_flags & SA_SIGINFO)
+        {
+            old->sa_sigaction(sig, info, uc);
+            return;
+        }
+        if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN)
+        {
+            old->sa_handler(sig);
+            return;
+        }
+        break;
+    }
+
+    /*
+     * Nobody asked for it, so the game is going down anyway.  This is the
+     * only case where the log is written, and a record of what happened
+     * is worth more than the speed of dying.
+     */
     if (g_crashed)
+    {
+        signal(sig, SIG_DFL);
+        raise(sig);
         _exit(128 + sig);
+    }
     g_crashed = 1;
+
+    /* the snapshot of the map is old by now, and the stack has to be read */
+    refresh_maps();
+
     unsigned long rip = 0;
     unsigned long rsp = 0;
     if (uc)
@@ -547,8 +597,15 @@ static void wieen_crash(int sig, siginfo_t* info, void* uc)
         rip = (unsigned long)c->uc_mcontext.gregs[REG_RIP];
         rsp = (unsigned long)c->uc_mcontext.gregs[REG_RSP];
     }
-    wieen_log("wieen: signal %d at %p (rip %#lx rsp %#lx, client base %#lx)\n",
-              sig, info ? info->si_addr : 0, rip, rsp, g_base);
+    /*
+     * si_code tells whether the processor faulted or somebody sent the
+     * signal; si_addr is only the faulting address in the first case.
+     */
+    wieen_log("wieen: signal %d at %p (rip %#lx rsp %#lx, client base %#lx, "
+              "code %d, from pid %d uid %d)\n",
+              sig, info ? info->si_addr : 0, rip, rsp, g_base,
+              info ? info->si_code : 0, info ? info->si_pid : 0,
+              info ? info->si_uid : 0);
     if (uc)
     {
         ucontext_t* c = (ucontext_t*)uc;
@@ -576,6 +633,52 @@ static void wieen_crash(int sig, siginfo_t* info, void* uc)
                           i, rsp + i * 8, *(unsigned long*)(rsp + i * 8),
                           *(unsigned long*)(rsp + i * 8) - g_base);
         }
+        /*
+         * A raw scan of the stack: every slot that points into code is a
+         * return address of somebody, and the module it belongs to says
+         * who.  This is what makes a fault readable without a debugger.
+         */
+        {
+            struct { unsigned long lo, hi; char name[64]; } mods[64];
+            int modcount = 0;
+            FILE* m = fopen("/proc/self/maps", "r");
+            char mline[512];
+            while (m && modcount < 64 && fgets(mline, sizeof(mline), m))
+            {
+                unsigned long ml, mh, moff;
+                char perms[8], mpath[256];
+                mpath[0] = 0;
+                if (sscanf(mline, "%lx-%lx %7s %lx %*s %*s %255s", &ml, &mh, perms,
+                           &moff, mpath) < 4)
+                    continue;
+                if (perms[2] != 'x')
+                    continue;
+                mods[modcount].lo = ml - moff;
+                mods[modcount].hi = mh;
+                snprintf(mods[modcount].name, sizeof(mods[modcount].name), "%s",
+                         mpath[0] ? mpath : "[anonymous]");
+                modcount++;
+            }
+            if (m)
+                fclose(m);
+
+            for (int i = 0; i < 128; i++)
+            {
+                unsigned long slot = rsp + i * 8;
+                if (!map_contains((void*)slot))
+                    break;
+                unsigned long value = *(unsigned long*)slot;
+                for (int k = 0; k < modcount; k++)
+                {
+                    if (value < mods[k].lo || value >= mods[k].hi)
+                        continue;
+                    wieen_log("wieen: stack[%d] %#lx -> %s+%#lx\n", i, value,
+                              mods[k].name, value - mods[k].lo);
+                    break;
+                }
+            }
+        }
+
         unsigned long frame = (unsigned long)c->uc_mcontext.gregs[REG_RBP];
         for (int i = 0; i < 16 && is_mapped((void*)frame) &&
              is_mapped((void*)(frame + 8)); i++)
@@ -614,10 +717,10 @@ static void wieen_crash(int sig, siginfo_t* info, void* uc)
         if (f)
             fclose(f);
     }
-    if (g_old_segv)
-        g_old_segv(sig, info, uc);
-    else
-        _exit(139);
+
+    signal(sig, SIG_DFL);
+    raise(sig);
+    _exit(128 + sig);
 }
 
 static void install_crash_handler(void)
@@ -627,16 +730,32 @@ static void install_crash_handler(void)
     sa.sa_sigaction = wieen_crash;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, 0);
-    sigaction(SIGBUS, &sa, 0);
-    sigaction(SIGILL, &sa, 0);
-    sigaction(SIGFPE, &sa, 0);
-    g_old_segv = 0;
+
+    for (int i = 0; i < WIEEN_FAULTS; i++)
+        sigaction(g_fault_signal[i], &sa, &g_old_action[i]);
 }
 
 /* ------------------------------------------------------------------ */
 /* finding the client image and the VM                                */
 /* ------------------------------------------------------------------ */
+
+/*
+ * A hash of the image of the client, so it is possible to tell whether it
+ * is the build the tables in tools/ were made for: Roblox ships a new
+ * client every now and then, and the numbering of the opcodes can change
+ * with it.
+ */
+static unsigned long long hash_image(unsigned long base, unsigned long size)
+{
+    unsigned long long h = 1469598103934665603ULL;
+    const unsigned char* p = (const unsigned char*)base;
+    for (unsigned long i = 0; i < size; i++)
+    {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
 
 static unsigned long find_client_base(void)
 {
@@ -716,17 +835,21 @@ static unsigned char* find_signature(unsigned char* lo, unsigned char* hi,
 /* ------------------------------------------------------------------ */
 
 /*
- * The stub is reached with an absolute jump, because a relative jump only
- * reaches two gigabytes and the client's image is usually much further
- * away from the mmap area than that.
+ * The first bytes of the function are replaced by a jump to a stub of
+ * ours, and the bytes that were there are replayed by a trampoline, so the
+ * function runs as if nothing happened:
  *
- * The patch is therefore ten bytes long:
+ *     the function:  49 BB <stub>   41 FF E3        mov r11, stub; jmp r11
+ *     the stub:      saves the registers, calls the handler, restores them,
+ *                    and jumps into the trampoline
+ *     the trampoline: the bytes of the prologue, then the rest of the
+ *                    function
  *
- *     49 BB <address of the stub>   mov r11, stub
- *     41 FF E3                       jmp r11
- *
- * and the trampoline replays the thirteen bytes of the prologue that were
- * overwritten, then continues in the original function.
+ * The bytes that are replaced are exactly one prologue of this client,
+ * thirteen bytes: push rbp; mov rbp, rsp; push r15; push r14; push rbx;
+ * push rax; mov r14d, edx.  They end on an instruction boundary, which is
+ * why the trampoline can replay them; the length is checked against the
+ * bytes of the client before the patch is written.
  */
 #define PROLOGUE_LEN 13
 
@@ -739,13 +862,25 @@ static void* alloc_exec(size_t len)
 
 static int install_hook(unsigned char* target, const unsigned char* prologue, int plen)
 {
+    /*
+     * The prologue that is about to be overwritten has to be the one the
+     * trampoline replays.  A client built from other sources would have
+     * other bytes here, and patching it would break the function.
+     */
+    if (memcmp(target, prologue, PROLOGUE_LEN) != 0)
+    {
+        wieen_log("wieen: the function does not start the way it did, not touching it\n");
+        return -1;
+    }
+    (void)plen;
+
     long page = ((long)target) & ~0xFFFUL;
     if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
     {
         wieen_log("wieen: mprotect failed: %s\n", strerror(errno));
         return -1;
     }
-    if (getenv("WIEEN_MPROTECT_ONLY"))
+    if (env_flag("WIEEN_MPROTECT_ONLY"))
     {
         wieen_log("wieen: mprotect only, no patch\n");
         mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
@@ -805,9 +940,6 @@ static int install_hook(unsigned char* target, const unsigned char* prologue, in
         s += 8;
     }
     *s++ = 0xFF; *s++ = 0xD0;                             /* call rax */
-    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x7C; *s++ = 0x24; *s++ = 0x58;
-    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x74; *s++ = 0x24; *s++ = 0x50;
-    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x54; *s++ = 0x24; *s++ = 0x48;
     *s++ = 0x41; *s++ = 0x5F;                             /* pop r15 */
     *s++ = 0x41; *s++ = 0x5E;                             /* pop r14 */
     *s++ = 0x41; *s++ = 0x5D;                             /* pop r13 */
@@ -894,7 +1026,29 @@ static void serve(int fd)
         if (read_exact(fd, &len, sizeof(len)) != 0)
             return;
         if (len > MAX_MESSAGE)
-            len = MAX_MESSAGE;
+        {
+            /*
+             * The script does not fit, and the bytes still have to leave
+             * the socket, or the next message would start in the middle
+             * of this one.
+             */
+            static char sink[4096];
+            uint32_t left = len;
+            while (left)
+            {
+                size_t want = left < sizeof(sink) ? left : sizeof(sink);
+                if (read_exact(fd, sink, want) != 0)
+                    return;
+                left -= (uint32_t)want;
+            }
+            const char too_big[] = "the script is too big";
+            uint32_t outlen = (uint32_t)(sizeof(too_big) - 1);
+            if (write_exact(fd, &outlen, sizeof(outlen)) != 0)
+                return;
+            if (write_exact(fd, too_big, outlen) != 0)
+                return;
+            continue;
+        }
 
         pthread_mutex_lock(&g_lock);
         g_pending_len = 0;
@@ -925,6 +1079,13 @@ static void serve(int fd)
         }
         if (!g_finished)
         {
+            /*
+             * The script is dropped: the game may still run it much
+             * later, and a script of a finished command must not run
+             * behind the back of the next one.
+             */
+            g_pending_ready = 0;
+            g_pending_len = 0;
             snprintf(g_result, sizeof(g_result),
                      "the game did not run the script - no Luau state is active");
             g_result_len = strlen(g_result);
@@ -945,8 +1106,14 @@ static void* server_thread(void* arg)
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SOCKET_PATH);
-    unlink(SOCKET_PATH);
+    char sock[512];
+    wieen_path(sock, sizeof(sock), SOCKET_FILE_NAME);
+    size_t socklen = strlen(sock);
+    if (socklen + 1 > sizeof(addr.sun_path))
+        socklen = sizeof(addr.sun_path) - 1;
+    memcpy(addr.sun_path, sock, socklen);
+    addr.sun_path[socklen] = 0;
+    unlink(sock);
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
@@ -954,11 +1121,11 @@ static void* server_thread(void* arg)
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
         listen(fd, 4) != 0)
     {
-        wieen_log("wieen: cannot listen on %s: %s\n", SOCKET_PATH, strerror(errno));
+        wieen_log("wieen: cannot listen on %s: %s\n", sock, strerror(errno));
         close(fd);
         return 0;
     }
-    wieen_log("wieen: listening on %s\n", SOCKET_PATH);
+    wieen_log("wieen: listening on %s\n", sock);
 
     for (;;)
     {
@@ -992,8 +1159,17 @@ static void* setup_thread(void* arg)
     if (!g_base)
         return 0;
 
-    install_crash_handler();
+    /*
+     * The handlers of the game are only watched when somebody asks for
+     * it: taking over a fault the game handles itself would turn a
+     * recoverable trap of the client into a dead process.
+     */
+    if (env_flag("WIEEN_FAULTLOG"))
+        install_crash_handler();
     refresh_maps();
+
+    wieen_log("wieen: image of the client at %p, hash %016llx\n", (void*)g_base,
+              hash_image(g_base, 16 * 1024 * 1024));
 
     unsigned long lo = 0, hi = 0;
     if (!find_text_range(&lo, &hi))
@@ -1059,7 +1235,7 @@ static void* setup_thread(void* arg)
     if (!g_resume_addr || !g_load || !g_tolstring || !g_newthread)
         return 0;
 
-    if (getenv("WIEEN_NOHOOK"))
+    if (env_flag("WIEEN_NOHOOK"))
     {
         wieen_log("wieen: hook disabled by WIEEN_NOHOOK\n");
     }
@@ -1079,6 +1255,13 @@ static void* setup_thread(void* arg)
 
 __attribute__((constructor)) static void wieen_init(void)
 {
+    /*
+     * WIEEN_OFF keeps the agent out of the way of a process entirely: the
+     * library is still preloaded, but nothing of it runs.  It is the only
+     * honest way to tell a fault of the game from a fault of ours.
+     */
+    if (env_flag("WIEEN_OFF"))
+        return;
     wieen_log("\n=== wieen agent (pid %d) ===\n", (int)getpid());
     pthread_t thread;
     if (pthread_create(&thread, 0, setup_thread, 0) == 0)
