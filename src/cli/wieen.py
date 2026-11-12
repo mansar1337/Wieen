@@ -4,7 +4,7 @@
 Talks to the agent that lives inside the Sober client process over a UNIX
 socket, executes Luau inside the game's own VM and prints the results.
 
-    wieen install              install the agent + flatpak override
+    wieen install              install the agent and preload it in the runtime
     wieen launch [url]         start Sober with the agent preloaded
     wieen status               check whether the agent is reachable
     wieen exec "return 1+1"    run a snippet
@@ -120,76 +120,32 @@ class Agent:
 # ---------------------------------------------------------------- commands
 
 
-def sober_install_dir() -> Path:
-    out = subprocess.run(["flatpak", "info", "--show-location", APP_ID],
-                         capture_output=True, text=True, check=True).stdout.strip()
-    return Path(out) / "files" / "bin"
-
-
-def cmd_patch(args: argparse.Namespace) -> int:
-    """Replace Sober's libbadcpu.so with the Wieen shim."""
-    bindir = sober_install_dir()
-    target = bindir / "libbadcpu.so"
-    original = bindir / "libbadcpu_orig.so"
-    shim = REPO / "build" / "libbadcpu.so"
-    if not shim.exists():
-        print(f"shim not built: {shim} (run: make shim)", file=sys.stderr)
-        return 1
-    if not target.exists():
-        print(f"unexpected layout, {target} missing", file=sys.stderr)
-        return 1
-
-    if not original.exists():
-        shutil.copy2(target, original)
-        print(f"original kept as {original}")
-    shutil.copy2(shim, target)
-    print(f"shim installed: {target}")
-    print("undo with: wieen unpatch")
-    return 0
-
-
-def cmd_unpatch(args: argparse.Namespace) -> int:
-    bindir = sober_install_dir()
-    target = bindir / "libbadcpu.so"
-    original = bindir / "libbadcpu_orig.so"
-    if original.exists():
-        shutil.copy2(original, target)
-        print(f"restored {target}")
-    else:
-        print("no backup found, nothing to restore", file=sys.stderr)
-        return 1
-    return 0
-
-
 def cmd_install(args: argparse.Namespace) -> int:
+    """Install the agent and make the flatpak runtime preload it."""
     if not AGENT_BUILD.exists():
         print(f"agent not built: {AGENT_BUILD} (run: make agent)", file=sys.stderr)
         return 1
+
     target = agent_path()
     shutil.copy2(AGENT_BUILD, target)
     print(f"agent installed: {target}")
 
-    sock = socket_path()
-    cmd = [
-        "flatpak", "override", "--user",
-        f"--env=WIEEN_SOCKET={sock}",
-        f"--env=WIEEN_AGENT={target}",
-        APP_ID,
-    ]
-    subprocess.run(cmd, check=True)
-    print("flatpak override set: WIEEN_SOCKET + WIEEN_AGENT")
-    print("patch Sober:        wieen patch")
-    print("start Sober with:   wieen launch")
+    script = REPO / "tools" / "install_preload.sh"
+    if not script.exists():
+        print(f"installer missing: {script}", file=sys.stderr)
+        return 1
+    if subprocess.call([str(script)]) != 0:
+        print("could not install the preload", file=sys.stderr)
+        return 1
+
+    print(f"socket: {socket_path()}")
+    print("start Sober with: wieen launch")
     return 0
 
 
 def cmd_launch(args: argparse.Namespace) -> int:
     if not agent_path().exists():
         print("agent not installed, run: wieen install", file=sys.stderr)
-        return 1
-    bindir = sober_install_dir()
-    if not (bindir / "libbadcpu_orig.so").exists():
-        print("Sober is not patched yet, run: wieen patch", file=sys.stderr)
         return 1
     cmd = ["flatpak", "run", APP_ID]
     if args.url:
@@ -274,14 +230,8 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("install", help="install the agent and set the flatpak override")
+    sp = sub.add_parser("install", help="install the agent and preload it in the runtime")
     sp.set_defaults(func=cmd_install)
-
-    sp = sub.add_parser("patch", help="patch Sober so it loads the agent")
-    sp.set_defaults(func=cmd_patch)
-
-    sp = sub.add_parser("unpatch", help="restore Sober's original libbadcpu.so")
-    sp.set_defaults(func=cmd_unpatch)
 
     sp = sub.add_parser("launch", help="start Sober with the agent preloaded")
     sp.add_argument("url", nargs="?", help="experience to open")
