@@ -47,6 +47,10 @@ def main() -> int:
         return 1
     print("connected to the agent")
 
+    # the client needs a moment before it runs its own scripts, and the
+    # agent can only work inside one of them
+    time.sleep(5)
+
     command = [str(COMPILER), "-"]
     if len(sys.argv) > 2 and sys.argv[2] == "--raw":
         command.append("--raw")

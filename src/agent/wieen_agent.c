@@ -129,8 +129,6 @@ static unsigned long g_base;
 #define LSTATE_BASECALLS 0x0a
 #define LSTATE_STATUS 0x03
 #define LSTATE_ACTIVE 0x06
-/* the debugstep hook of the global state (the client runs in single step) */
-#define LSTATE_DEBUGSTEP 0x680
 
 /* ------------------------------------------------------------------ */
 /* logging                                                            */
@@ -188,20 +186,36 @@ static void refresh_maps(void)
 {
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f)
+    {
+        wieen_log("wieen: cannot read the map of memory\n");
         return;
-    g_mapcount = 0;
+    }
+    int count = 0;
     char line[512];
-    while (g_mapcount < (int)(sizeof(g_maps) / sizeof(g_maps[0])) &&
-           fgets(line, sizeof(line), f))
+    while (count < (int)(sizeof(g_maps) / sizeof(g_maps[0])) && fgets(line, sizeof(line), f))
     {
         unsigned long lo, hi;
         if (sscanf(line, "%lx-%lx", &lo, &hi) != 2)
             continue;
-        g_maps[g_mapcount].lo = lo;
-        g_maps[g_mapcount].hi = hi;
-        g_mapcount++;
+        g_maps[count].lo = lo;
+        g_maps[count].hi = hi;
+        count++;
     }
     fclose(f);
+
+    /*
+     * A short read means the map was taken while the client was mapping
+     * something; the old one is kept in that case, because a map with
+     * holes in it would throw away the regions we already know.
+     */
+    if (count < g_mapcount / 2)
+    {
+        wieen_log("wieen: the map of memory came back short (%d regions), keeping the old one\n",
+                  count);
+        return;
+    }
+
+    g_mapcount = count;
 }
 
 static int map_contains(void* p)
@@ -239,22 +253,52 @@ static int is_mapped(void* p)
  * like one: the state itself is mapped, it points at a global state, and
  * the stack of the state is a pair of pointers into the same array.
  */
+/*
+ * The client keeps growing its heap, so the map of memory is a snapshot
+ * that goes out of date; a state of the game can be in a region the
+ * snapshot does not know about.  The state comes from lua_resume, so it
+ * is a real one even then, and the checks that matter are the ones on
+ * the state itself.
+ */
 static int state_is_usable(void* L)
 {
     if (!L || ((unsigned long)L & 7) != 0)
         return 0;
-    if (!is_mapped(L))
-        return 0;
+
+    int known = is_mapped(L);
+    if (!known)
+    {
+        /*
+         * The map of memory may be out of date: the client grows its heap
+         * while it loads a place.  The state comes from lua_resume, so it
+         * is a real one even when the map does not say so.
+         */
+        refresh_maps();
+        known = is_mapped(L);
+        if (!known)
+        {
+            static int warned;
+            if (!warned)
+            {
+                warned = 1;
+                wieen_log("wieen: the state %p is not in the map of memory, "
+                          "trusting the hook\n", L);
+            }
+            known = 2;
+        }
+    }
 
     void* global = *(void**)((char*)L + LSTATE_GLOBAL);
-    if (!global || !is_mapped(global))
+    if (!global)
         return 0;
-    if (!is_mapped((char*)global + 0x48) || !is_mapped((char*)global + 0x50))
+    if (known == 1 && !is_mapped(global))
         return 0;
 
     char* base = *(char**)((char*)L + LSTATE_BASE);
     char* top = *(char**)((char*)L + LSTATE_TOP);
-    if (!base || !top || !is_mapped(base) || !is_mapped(top))
+    if (!base || !top)
+        return 0;
+    if (known == 1 && (!is_mapped(base) || !is_mapped(top)))
         return 0;
     if (top < base)
         return 0;
@@ -271,17 +315,19 @@ static const char* state_problem(void* L)
     if (!L || ((unsigned long)L & 7) != 0)
         return "the state is not aligned";
     if (!is_mapped(L))
-        return "the state is not mapped";
+        return "the state is not in the map of memory";
 
     void* global = *(void**)((char*)L + LSTATE_GLOBAL);
-    if (!global || !is_mapped(global))
+    if (!global)
         return "no global state";
-    if (!is_mapped((char*)global + 0x48) || !is_mapped((char*)global + 0x50))
+    if (!is_mapped(global))
         return "the global state is not mapped";
 
     char* base = *(char**)((char*)L + LSTATE_BASE);
     char* top = *(char**)((char*)L + LSTATE_TOP);
-    if (!base || !top || !is_mapped(base) || !is_mapped(top))
+    if (!base || !top)
+        return "the stack is not there";
+    if (!is_mapped(base) || !is_mapped(top))
         return "the stack is not mapped";
     if (top < base)
         return "the stack is upside down";
@@ -364,17 +410,6 @@ static void run_pending(void* parent)
                       *(void**)((char*)thread + 0x18));
 
             /*
-             * The client runs its interpreter in single step mode: it calls
-             * the debugstep hook of the global state before every single
-             * instruction.  The hook belongs to the game, so it is taken
-             * off while our chunk runs and put back afterwards.
-             */
-            void* global = *(void**)((char*)thread + LSTATE_GLOBAL);
-            void* hook = *(void**)((char*)global + LSTATE_DEBUGSTEP);
-            *(void**)((char*)global + LSTATE_DEBUGSTEP) = 0;
-            wieen_log("wieen: debugstep hook was %p\n", hook);
-
-            /*
              * A script that yields (wait(), task.wait()) is resumed right
              * away: the game has no scheduler for a thread of ours, and a
              * script that waits for a moment is what we want to run to
@@ -394,7 +429,6 @@ static void run_pending(void* parent)
                 }
             }
 
-            *(void**)((char*)global + LSTATE_DEBUGSTEP) = hook;
             wieen_log("wieen: lua_resume returned %d, status=%d, resumes=%d\n",
                       status, *(unsigned char*)((char*)thread + LSTATE_STATUS),
                       resumes);
@@ -487,7 +521,7 @@ static void wieen_on_resume(void* L, void* from, long nargs)
                   g_hits, L, from, nargs);
     if (state_is_usable(L))
         run_pending(L);
-    else if (g_hits <= 8)
+    else if (g_hits <= 8 || (g_hits % 200) == 0)
         wieen_log("wieen: that state does not look like a Luau state (%s), skipping\n",
                   state_problem(L));
     g_in_hook = 0;
