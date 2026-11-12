@@ -77,18 +77,28 @@ wieen-compile  ──байткод──▶  UNIX-сокет
 ```sh
 make agent    # build/wieen_agent.so — агент
 make compile  # build/wieen-compile — хостовый компилятор
+make deploy   # собрать агента и положить его туда, откуда его берёт Sober
+make install  # то же + прописать агента в рантайм flatpak (нужен root)
 make symbols  # пересобрать src/agent/luau_symbols.h под текущий клиент
 ```
 
 ```sh
-# установить агент
-tools/install_preload.sh
-cp build/wieen_agent.so "$HOME/.var/app/org.vinegarhq.Sober/data/wieen/wieen_agent.so"
+# один раз: поставить агента в рантайм
+make install
 
-# проверить
+# запустить игру
+flatpak run org.vinegarhq.Sober
+
+# в другом терминале — выполнить скрипт
+python3 src/cli/wieen.py exec 'print("hello world!")'
+
+# или одной командой (сама поднимает и гасит Sober)
 python3 tools/quick_test.py 'return "wieen-ok"' --raw
 python3 tools/selftest.py
 ```
+
+Агент грузится при старте клиента, поэтому после `make deploy` игру надо
+перезапустить.
 
 ## Структура
 
