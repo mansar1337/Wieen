@@ -125,7 +125,7 @@ def main() -> int:
         if not alive(proc):
             print("the client is gone already")
             return 1
-        time.sleep(3)
+        time.sleep(1)
 
     print(f"idling for {idle} seconds")
     deadline = time.time() + idle

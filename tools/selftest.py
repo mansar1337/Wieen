@@ -116,7 +116,7 @@ def main() -> int:
     failed = 0
     for name, source in SNIPPETS:
         result = run(source)
-        status = "ok " if not result.startswith("error:") else "FAIL"
+        status = "FAIL" if result.startswith("error:") and name != "error" else "ok "
         print(f"  {status} {name:16} {result}")
         if result.startswith("error:") and name != "error":
             failed += 1
