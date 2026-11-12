@@ -274,7 +274,11 @@ int main(int argc, char** argv)
     {
         wrapped = "local __wieen = function()\n";
         wrapped += source;
-        wrapped += "\nend\nreturn tostring(__wieen())\n";
+        /*
+         * The extra parentheses make the call give exactly one value, so
+         * a script that returns nothing is a nil instead of an error.
+         */
+        wrapped += "\nend\nreturn tostring((__wieen()))\n";
     }
     else
     {

@@ -225,7 +225,7 @@ static int is_mapped(void* p)
      * then: the hook fires thousands of times a second.
      */
     static int misses;
-    if (++misses < 64)
+    if (++misses < 4)
         return 0;
 
     misses = 0;
