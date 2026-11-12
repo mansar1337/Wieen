@@ -10,13 +10,13 @@
  *   - finds the client image in its own address space,
  *   - locates the Luau VM's entry points by their code signature, so the
  *     agent keeps working when the client is updated,
- *   - hooks lua_pcall, which hands us the game's own lua_State whenever
+ *   - hooks lua_resume, which hands us the game's own lua_State whenever
  *     the game runs a script,
  *   - serves a UNIX socket: the host sends a compiled Luau chunk, the
  *     agent runs it inside the game's VM and returns the result.
  *
  * The code always runs on the game's script thread, inside the hook of
- * lua_pcall, because a Luau state must not be touched from another
+ * lua_resume, because a Luau state must not be touched from another
  * thread.
  */
 #define _GNU_SOURCE
@@ -46,7 +46,8 @@
 
 typedef int (*fn_load)(void* L, const char* chunkname, const char* data,
                         unsigned long size, int env);
-typedef int (*fn_pcall)(void* L, int nargs, int nresults, int errfunc);
+typedef int (*fn_resume)(void* L, void* from, int nargs);
+typedef void* (*fn_newthread)(void* L);
 typedef const char* (*fn_tolstring)(void* L, int idx, unsigned long* len);
 
 /*
@@ -65,7 +66,7 @@ struct signature
     unsigned long offset;  /* where the function was found */
 };
 
-static const unsigned char SIG_PCALL[] = {
+static const unsigned char SIG_RESUME[] = {
     0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50,
     0x41, 0x89, 0xd6, 0x48, 0x89, 0xfb,
 };
@@ -86,22 +87,50 @@ static const unsigned char SIG_TOLSTRING[] = {
  * enough - it is not unique in the image - so the offset is checked
  * first, and only if the client moved do we look for the closest match.
  */
+static const unsigned char SIG_NEWTHREAD[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xfb,
+    0x48, 0x8b, 0x47, 0x38, 0x48, 0x8b, 0x48, 0x50, 0x48, 0x3b,
+    0x48, 0x48,
+};
+
 static const struct signature SIGNATURES[] = {
-    {"lua_pcall", SIG_PCALL, (int)sizeof(SIG_PCALL), 0x22e9432UL},
+    {"lua_resume", SIG_RESUME, (int)sizeof(SIG_RESUME), 0x22e9432UL},
     {"luau_load", SIG_LOAD, (int)sizeof(SIG_LOAD), 0x22e4b72UL},
     {"lua_tolstring", SIG_TOLSTRING, (int)sizeof(SIG_TOLSTRING), 0x22e5f48UL},
+    {"lua_newthread", SIG_NEWTHREAD, (int)sizeof(SIG_NEWTHREAD), 0x22e24d7UL},
 };
-#define NSIG (int)(sizeof(SIGNATURES) / sizeof(SIGNATURES[0]))
+#define WIEEN_NSIG (int)(sizeof(SIGNATURES) / sizeof(SIGNATURES[0]))
 
 static fn_load g_load;
-static fn_pcall g_pcall;
+static fn_resume g_resume;
+static fn_newthread g_newthread;
 static fn_tolstring g_tolstring;
-static void* g_pcall_addr;
+static void* g_resume_addr;
 static unsigned long g_base;
 
 /* the offsets of the stack in a lua_State, taken from the client's code */
-#define LSTATE_BASE 0x48
-#define LSTATE_TOP 0x50
+/*
+ * The layout of the state in this client, taken from the code:
+ *   lua_tolstring (0x22e5f48) computes the value of a positive index as
+ *   [L+0x50] + (index-1)*16 and compares it against [L+0x48], so +0x50 is
+ *   the base of the stack and +0x48 is its top;
+ *   the hooked call (0x22e9432) takes the callee from
+ *   [L+0x48] - nargs*16 - 16;
+ *   luau_load (0x22e4b72) reads the global state from [L+0x38];
+ *   +0x40 holds the first slot of the stack array, +0x30 the current
+ *   call info, +0x08/+0x0a the C call counters and +0x03 the status.
+ */
+#define LSTATE_GLOBAL 0x38
+#define LSTATE_STACK 0x40
+#define LSTATE_TOP 0x48
+#define LSTATE_BASE 0x50
+#define LSTATE_CI 0x30
+#define LSTATE_NCCALLS 0x08
+#define LSTATE_BASECALLS 0x0a
+#define LSTATE_STATUS 0x03
+#define LSTATE_ACTIVE 0x06
+/* the debugstep hook of the global state (the client runs in single step) */
+#define LSTATE_DEBUGSTEP 0x680
 
 /* ------------------------------------------------------------------ */
 /* logging                                                            */
@@ -139,8 +168,8 @@ static volatile int g_in_hook;
 /* ------------------------------------------------------------------ */
 
 static void* g_trampoline;
-static void wieen_on_pcall(void* L, long a, long b, long c);
-static void (*g_handler)(void*, long, long, long) = wieen_on_pcall;
+static void wieen_on_resume(void* L, void* from, long nargs);
+static void (*g_handler)(void*, void*, long) = wieen_on_resume;
 
 /* ------------------------------------------------------------------ */
 /* a small view of the memory map                                     */
@@ -197,14 +226,14 @@ static int state_is_usable(void* L)
     if (!is_mapped(L))
         return 0;
 
-    void* global = *(void**)((char*)L + 0x38);
+    void* global = *(void**)((char*)L + LSTATE_GLOBAL);
     if (!global || !is_mapped(global))
         return 0;
     if (!is_mapped((char*)global + 0x48) || !is_mapped((char*)global + 0x50))
         return 0;
 
-    char* base = *(char**)((char*)L + 0x48);
-    char* top = *(char**)((char*)L + 0x50);
+    char* base = *(char**)((char*)L + LSTATE_BASE);
+    char* top = *(char**)((char*)L + LSTATE_TOP);
     if (!base || !top || !is_mapped(base) || !is_mapped(top))
         return 0;
     if (top < base)
@@ -214,6 +243,33 @@ static int state_is_usable(void* L)
     if ((top - base) / 16 > 100000)
         return 0;
     return 1;
+}
+
+/* the same check, but it says why it said no */
+static const char* state_problem(void* L)
+{
+    if (!L || ((unsigned long)L & 7) != 0)
+        return "the state is not aligned";
+    if (!is_mapped(L))
+        return "the state is not mapped";
+
+    void* global = *(void**)((char*)L + LSTATE_GLOBAL);
+    if (!global || !is_mapped(global))
+        return "no global state";
+    if (!is_mapped((char*)global + 0x48) || !is_mapped((char*)global + 0x50))
+        return "the global state is not mapped";
+
+    char* base = *(char**)((char*)L + LSTATE_BASE);
+    char* top = *(char**)((char*)L + LSTATE_TOP);
+    if (!base || !top || !is_mapped(base) || !is_mapped(top))
+        return "the stack is not mapped";
+    if (top < base)
+        return "the stack is upside down";
+    if (((top - base) % 16) != 0)
+        return "the stack is not a multiple of a slot";
+    if ((top - base) / 16 > 100000)
+        return "the stack is too big";
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -235,63 +291,137 @@ static void copy_result(char* out, size_t cap, size_t* outlen, const char* text,
  * Runs the pending chunk in the given state.  The stack of the state is
  * restored afterwards, so the game does not notice that we were here.
  */
-static void run_pending(void* L)
+static void run_pending(void* parent)
 {
-    unsigned char* bytecode;
     size_t bclen;
 
     pthread_mutex_lock(&g_lock);
-    if (!g_pending_ready || !L)
+    if (!g_pending_ready || !parent)
     {
         pthread_mutex_unlock(&g_lock);
         return;
     }
     g_pending_ready = 0;
-    bytecode = g_pending;
     bclen = g_pending_len;
     pthread_mutex_unlock(&g_lock);
 
     static unsigned char chunk[MAX_MESSAGE];
-    memcpy(chunk, bytecode, bclen);
+    memcpy(chunk, g_pending, bclen);
 
-    /* remember where the stack was */
-    char* base = *(char**)((char*)L + LSTATE_BASE);
-    char* top = *(char**)((char*)L + LSTATE_TOP);
-    ptrdiff_t slots = (top - base) / 16;
-
-    char* message;
+    /* The thread object on the parent stack roots our coroutine against GC. */
+    char* saved_top = *(char**)((char*)parent + LSTATE_TOP);
+    const char* message = 0;
     size_t messagelen = 0;
     int status = -1;
+    wieen_log("wieen: creating thread for %lu bytes in parent %p\n",
+              (unsigned long)bclen, parent);
+    void* thread = g_newthread(parent);
 
-    wieen_log("wieen: running %lu bytes of bytecode in %p\n", (unsigned long)bclen, L);
-    int rc = g_load(L, "=wieen", (const char*)chunk, bclen, 0);
-    wieen_log("wieen: luau_load returned %d\n", rc);
-    if (rc != 0)
-    {
-        message = (char*)g_tolstring(L, -1, &messagelen);
-        status = -1;
-    }
+    wieen_log("wieen: created thread %p\n", thread);
+
+    if (!thread)
+        message = "lua_newthread returned NULL";
     else
     {
-        status = g_pcall(L, 0, 1, 0);
-        wieen_log("wieen: pcall returned %d\n", status);
-        message = (char*)g_tolstring(L, -1, &messagelen);
-        wieen_log("wieen: tolstring gave %p (%lu bytes)\n", message,
-                  (unsigned long)messagelen);
+        status = g_load(thread, "=wieen", (const char*)chunk, bclen, 0);
+        wieen_log("wieen: luau_load returned %d\n", status);
+        char* top = *(char**)((char*)thread + LSTATE_TOP);
+        wieen_log("wieen: loaded %lu bytes, the function is at %p\n",
+                  (unsigned long)bclen, top - 16);
+        if (status == 0)
+        {
+            /*
+             * The thread now has the loaded function on its stack, so
+             * resuming it without arguments runs it.  lua_resume does the
+             * whole job: it sets up the call frame, runs the interpreter
+             * and restores the state afterwards.
+             */
+            wieen_log("wieen: resuming thread %p, status=%d active=%d ci=%p baseci=%p\n",
+                      thread,
+                      *(unsigned char*)((char*)thread + LSTATE_STATUS),
+                      *(unsigned char*)((char*)thread + LSTATE_ACTIVE),
+                      *(void**)((char*)thread + LSTATE_CI),
+                      *(void**)((char*)thread + 0x18));
+
+            /*
+             * The client runs its interpreter in single step mode: it calls
+             * the debugstep hook of the global state before every single
+             * instruction.  The hook belongs to the game, so it is taken
+             * off while our chunk runs and put back afterwards.
+             */
+            void* global = *(void**)((char*)thread + LSTATE_GLOBAL);
+            void* hook = *(void**)((char*)global + LSTATE_DEBUGSTEP);
+            *(void**)((char*)global + LSTATE_DEBUGSTEP) = 0;
+            wieen_log("wieen: debugstep hook was %p\n", hook);
+
+            status = g_resume(thread, 0, 0);
+
+            *(void**)((char*)global + LSTATE_DEBUGSTEP) = hook;
+            wieen_log("wieen: lua_resume returned %d, status=%d\n",
+                      status, *(unsigned char*)((char*)thread + LSTATE_STATUS));
+        }
+        wieen_log("wieen: reading result\n");
+        message = g_tolstring(thread, -1, &messagelen);
+        if (!message)
+        {
+            /*
+             * lua_tolstring only knows strings and numbers; for the
+             * other types the tag of the value is read from the stack.
+             */
+            char* top = *(char**)((char*)thread + LSTATE_TOP);
+            if (is_mapped(top) && is_mapped(top - 16))
+            {
+                char* value = top - 16;
+                int tag = *(int*)(value + 12);
+                static char other[64];
+                if (tag == 0)
+                {
+                    message = "nil";
+                }
+                else if (tag == 1)
+                {
+                    message = (*(int*)value) ? "true" : "false";
+                }
+                else if (tag == 5)
+                {
+                    message = "table";
+                }
+                else if (tag == 6)
+                {
+                    message = "function";
+                }
+                else
+                {
+                    snprintf(other, sizeof(other), "a value of type %d", tag);
+                    message = other;
+                }
+                messagelen = strlen(message);
+            }
+        }
     }
 
+    if (status == 1)
+    {
+        message = "coroutine yielded; yielding scripts are not supported yet";
+        messagelen = strlen(message);
+        status = -1;
+    }
+
+    /* Copy while the Luau string is alive, then remove the thread reference. */
     pthread_mutex_lock(&g_lock);
     if (status == 0)
-    {
         copy_result(g_result, sizeof(g_result), &g_result_len, message, messagelen);
-    }
     else
     {
         static const char prefix[] = "error: ";
         size_t n = sizeof(prefix) - 1;
         memcpy(g_result, prefix, n);
-        if (message && messagelen && n + messagelen < sizeof(g_result))
+        if (message)
         {
+            if (!messagelen)
+                messagelen = strlen(message);
+            if (messagelen > sizeof(g_result) - n - 1)
+                messagelen = sizeof(g_result) - n - 1;
             memcpy(g_result + n, message, messagelen);
             n += messagelen;
         }
@@ -302,31 +432,25 @@ static void run_pending(void* L)
     pthread_cond_signal(&g_done);
     pthread_mutex_unlock(&g_lock);
 
-    /* put the stack back where it was */
-    base = *(char**)((char*)L + LSTATE_BASE);
-    *(char**)((char*)L + LSTATE_TOP) = base + slots * 16;
+    *(char**)((char*)parent + LSTATE_TOP) = saved_top;
 }
 
 static volatile int g_hits;
 
-static void wieen_on_pcall(void* L, long a, long b, long c)
+static void wieen_on_resume(void* L, void* from, long nargs)
 {
     if (g_in_hook)
         return;
     g_in_hook = 1;
     g_hits++;
     if (g_hits <= 8 || (g_hits % 200) == 0)
-    {
-        void* global = L ? *(void**)((char*)L + 0x38) : 0;
-        unsigned long* f = L ? (unsigned long*)L : 0;
-        wieen_log("wieen: lua_pcall hit %d, L=%p global=%p args=%ld,%ld,%ld"
-                  " state[8]=%#lx state[0x48]=%#lx state[0x50]=%#lx\n",
-                  g_hits, L, global, a, b, c, f[8], f[0x48], f[0x50]);
-    }
+        wieen_log("wieen: lua_resume hit %d, L=%p from=%p nargs=%ld\n",
+                  g_hits, L, from, nargs);
     if (state_is_usable(L))
         run_pending(L);
     else if (g_hits <= 8)
-        wieen_log("wieen: that state does not look like a Luau state, skipping\n");
+        wieen_log("wieen: that state does not look like a Luau state (%s), skipping\n",
+                  state_problem(L));
     g_in_hook = 0;
 }
 
@@ -335,9 +459,13 @@ static void wieen_on_pcall(void* L, long a, long b, long c)
 /* ------------------------------------------------------------------ */
 
 static void (*g_old_segv)(int, siginfo_t*, void*);
+static int g_crashed;
 
 static void wieen_crash(int sig, siginfo_t* info, void* uc)
 {
+    if (g_crashed)
+        _exit(128 + sig);
+    g_crashed = 1;
     unsigned long rip = 0;
     unsigned long rsp = 0;
     if (uc)
@@ -348,18 +476,61 @@ static void wieen_crash(int sig, siginfo_t* info, void* uc)
     }
     wieen_log("wieen: signal %d at %p (rip %#lx rsp %#lx, client base %#lx)\n",
               sig, info ? info->si_addr : 0, rip, rsp, g_base);
+    if (uc)
+    {
+        ucontext_t* c = (ucontext_t*)uc;
+        wieen_log("wieen: regs rax=%#lx rbx=%#lx rcx=%#lx rdx=%#lx rsi=%#lx rdi=%#lx rbp=%#lx r12=%#lx r14=%#lx r15=%#lx\n",
+                  (unsigned long)c->uc_mcontext.gregs[REG_RAX],
+                  (unsigned long)c->uc_mcontext.gregs[REG_RBX],
+                  (unsigned long)c->uc_mcontext.gregs[REG_RCX],
+                  (unsigned long)c->uc_mcontext.gregs[REG_RDX],
+                  (unsigned long)c->uc_mcontext.gregs[REG_RSI],
+                  (unsigned long)c->uc_mcontext.gregs[REG_RDI],
+                  (unsigned long)c->uc_mcontext.gregs[REG_RBP],
+                  (unsigned long)c->uc_mcontext.gregs[REG_R12],
+                  (unsigned long)c->uc_mcontext.gregs[REG_R14],
+                  (unsigned long)c->uc_mcontext.gregs[REG_R15]);
+        wieen_log("wieen: more regs r8=%#lx r9=%#lx r10=%#lx r11=%#lx r13=%#lx\n",
+                  (unsigned long)c->uc_mcontext.gregs[REG_R8],
+                  (unsigned long)c->uc_mcontext.gregs[REG_R9],
+                  (unsigned long)c->uc_mcontext.gregs[REG_R10],
+                  (unsigned long)c->uc_mcontext.gregs[REG_R11],
+                  (unsigned long)c->uc_mcontext.gregs[REG_R13]);
+        if (is_mapped((void*)rsp))
+        {
+            for (int i = 0; i < 8 && is_mapped((void*)(rsp + i * 8)); i++)
+                wieen_log("wieen: stack[%d] @ %#lx = %#lx (client %#lx)\n",
+                          i, rsp + i * 8, *(unsigned long*)(rsp + i * 8),
+                          *(unsigned long*)(rsp + i * 8) - g_base);
+        }
+        unsigned long frame = (unsigned long)c->uc_mcontext.gregs[REG_RBP];
+        for (int i = 0; i < 16 && is_mapped((void*)frame) &&
+             is_mapped((void*)(frame + 8)); i++)
+        {
+            unsigned long next = *(unsigned long*)frame;
+            unsigned long ret = *(unsigned long*)(frame + 8);
+            wieen_log("wieen: frame[%d] rbp=%#lx ret=%#lx (client %#lx)\n",
+                      i, frame, ret, ret - g_base);
+            if (next <= frame || next - frame > 0x100000)
+                break;
+            frame = next;
+        }
+    }
     if (g_base)
         wieen_log("wieen: rip is at client offset %#lx\n", rip - g_base);
     /* the bytes around the fault, and the mapping it belongs to */
     {
         char code[64];
         int n = 0;
-        for (int i = 0; i < 32; i++)
+        if (is_mapped((void*)rip))
         {
-            unsigned char b = ((unsigned char*)rip)[i];
-            n += snprintf(code + n, sizeof(code) - n, "%02x", b);
+            for (int i = 0; i < 32; i++)
+            {
+                unsigned char b = ((unsigned char*)rip)[i];
+                n += snprintf(code + n, sizeof(code) - n, "%02x", b);
+            }
+            wieen_log("wieen: code at rip: %s\n", code);
         }
-        wieen_log("wieen: code at rip: %s\n", code);
     }
     {
         FILE* f = fopen("/proc/self/maps", "r");
@@ -542,7 +713,17 @@ static int install_hook(unsigned char* target, const unsigned char* prologue, in
     *s++ = 0x41; *s++ = 0x55;                             /* push r13 */
     *s++ = 0x41; *s++ = 0x56;                             /* push r14 */
     *s++ = 0x41; *s++ = 0x57;                             /* push r15 */
-    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x7C; *s++ = 0x24; *s++ = 0x08; /* mov rdi,[rsp+8] */
+    /*
+     * The registers were pushed in this order: rax, rdi, rsi, rdx, rcx,
+     * r8, r9, rbx, rbp, r12, r13, r14, r15.  The state is in the saved
+     * rdi, which is 11 slots below the top of the stack: r15 at +0, r14
+     * at +8, r13 at +16, r12 at +24, rbp at +32, rbx at +40, r9 at +48,
+     * r8 at +56, rcx at +64, rdx at +72, rsi at +80, rdi at +88.  Reload
+     * all three arguments after the handler: its C call clobbers rsi/rdx.
+     */
+    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x7C; *s++ = 0x24; *s++ = 0x58; /* mov rdi,[rsp+0x58] */
+    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x74; *s++ = 0x24; *s++ = 0x50; /* mov rsi,[rsp+0x50] */
+    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x54; *s++ = 0x24; *s++ = 0x48; /* mov rdx,[rsp+0x48] */
     *s++ = 0x48; *s++ = 0xB8;                             /* mov rax, handler */
     {
         unsigned long v = (unsigned long)(void*)g_handler;
@@ -551,6 +732,9 @@ static int install_hook(unsigned char* target, const unsigned char* prologue, in
         s += 8;
     }
     *s++ = 0xFF; *s++ = 0xD0;                             /* call rax */
+    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x7C; *s++ = 0x24; *s++ = 0x58;
+    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x74; *s++ = 0x24; *s++ = 0x50;
+    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x54; *s++ = 0x24; *s++ = 0x48;
     *s++ = 0x41; *s++ = 0x5F;                             /* pop r15 */
     *s++ = 0x41; *s++ = 0x5E;                             /* pop r14 */
     *s++ = 0x41; *s++ = 0x5D;                             /* pop r13 */
@@ -745,7 +929,7 @@ static void* setup_thread(void* arg)
     unsigned char* text = (unsigned char*)lo;
     unsigned char* end = (unsigned char*)hi;
 
-    for (int i = 0; i < NSIG; i++)
+    for (int i = 0; i < WIEEN_NSIG; i++)
     {
         const struct signature* sig = &SIGNATURES[i];
         unsigned char* at = 0;
@@ -787,26 +971,31 @@ static void* setup_thread(void* arg)
         wieen_log("wieen: %s at %p (offset %#lx)\n", sig->name, at,
                   (unsigned long)(at - (unsigned char*)g_base));
         if (i == 0)
-            g_pcall_addr = at;
+        {
+            g_resume_addr = at;
+            g_resume = (fn_resume)at;
+        }
         else if (i == 1)
             g_load = (fn_load)at;
-        else
+        else if (i == 2)
             g_tolstring = (fn_tolstring)at;
+        else
+            g_newthread = (fn_newthread)at;
     }
 
-    if (!g_pcall_addr || !g_load || !g_tolstring)
+    if (!g_resume_addr || !g_load || !g_tolstring || !g_newthread)
         return 0;
 
     if (getenv("WIEEN_NOHOOK"))
     {
         wieen_log("wieen: hook disabled by WIEEN_NOHOOK\n");
     }
-    else if (install_hook((unsigned char*)g_pcall_addr, SIG_PCALL,
-                          (int)sizeof(SIG_PCALL)) != 0)
+    else if (install_hook((unsigned char*)g_resume_addr, SIG_RESUME,
+                          (int)sizeof(SIG_RESUME)) != 0)
         return 0;
     else
     {
-        wieen_log("wieen: hooked lua_pcall at %p\n", g_pcall_addr);
+        wieen_log("wieen: hooked lua_resume at %p\n", g_resume_addr);
     }
 
     pthread_t thread;

@@ -47,8 +47,10 @@ def main() -> int:
         return 1
     print("connected to the agent")
 
-    proc = subprocess.run([str(COMPILER), "-"], input=source.encode(),
-                          capture_output=True)
+    command = [str(COMPILER), "-"]
+    if len(sys.argv) > 2 and sys.argv[2] == "--raw":
+        command.append("--raw")
+    proc = subprocess.run(command, input=source.encode(), capture_output=True)
     if proc.returncode != 0:
         print("compilation failed:", proc.stderr.decode(errors="replace"))
         return 1

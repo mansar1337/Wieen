@@ -9,7 +9,13 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-DATA="$HOME/.var/app/org.vinegarhq.Sober/data/wieen"
+# Preserve the invoking user's home when the script is run through sudo.
+USER_HOME="${SUDO_HOME:-}"
+if [ -z "$USER_HOME" ] && [ -n "${SUDO_USER:-}" ]; then
+    USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+fi
+USER_HOME="${USER_HOME:-$HOME}"
+DATA="$USER_HOME/.var/app/org.vinegarhq.Sober/data/wieen"
 # pick the runtime version Sober actually uses
 VER=$(flatpak info org.vinegarhq.Sober 2>/dev/null | sed -n 's/.*Runtime:.*\/\([0-9][0-9]*\)$/\1/p' | tail -1)
 RUNTIME=""
