@@ -286,7 +286,14 @@ int main(int argc, char** argv)
     }
 
     size_t size = 0;
-    char* bytecode = luau_compile(wrapped.data(), wrapped.size(), nullptr, &size);
+    lua_CompileOptions options;
+    memset(&options, 0, sizeof(options));
+    options.optimizationLevel = 1;
+    options.debugLevel = 1;
+    for (int i = 2; i < argc; i++)
+        if (strcmp(argv[i], "--nodebug") == 0)
+            options.debugLevel = 0;
+    char* bytecode = luau_compile(wrapped.data(), wrapped.size(), &options, &size);
     if (!bytecode || !size)
     {
         fprintf(stderr, "wieen-compile: compilation failed\n");

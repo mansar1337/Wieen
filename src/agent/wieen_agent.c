@@ -203,6 +203,10 @@ static int env_flag(const char* name)
 
 static void run_pending(void* parent);
 static void run_probe(void* L);
+static void collect_capabilities(unsigned char* g);
+
+/* the richest set of capabilities of the states of the VM */
+static unsigned int g_rich_caps;
 
 /*
  * The state of the game and the callback that is put into it.  The
@@ -468,8 +472,30 @@ static void run_pending(void* parent)
          */
         unsigned int caps =
             *(const unsigned int*)((const unsigned char*)parent + LSTATE_CAPS);
+        if (g_rich_caps > caps)
+            caps = g_rich_caps;
         *(unsigned int*)((unsigned char*)thread + LSTATE_CAPS) = caps;
         wieen_log("wieen: the capabilities of the thread are %#.x\n", caps);
+    }
+
+    if (thread && env_flag("WIEEN_CAPSCAN"))
+    {
+        /* Every state of the VM has its own set of capabilities: the main
+         * one of the game is richer than the thread of a script. */
+        unsigned char* g =
+            *(unsigned char**)((char*)parent + LSTATE_GLOBAL);
+        wieen_log("wieen: the states of the VM at %p:\n", g);
+        for (unsigned long off = 0; off + 8 <= 0x720; off += 8)
+        {
+            unsigned long p = *(unsigned long*)(g + off);
+            if (!p || !is_mapped((void*)p))
+                continue;
+            if (*(unsigned long*)((char*)p + LSTATE_GLOBAL) != (unsigned long)g)
+                continue;
+            wieen_log("wieen:   state %p at +%#lx has the capabilities %#.x\n",
+                      (void*)p, off,
+                      *(unsigned int*)((char*)p + LSTATE_CAPS));
+        }
     }
 
     wieen_log("wieen: created thread %p\n", thread);
@@ -808,6 +834,17 @@ static int has_state_reference(unsigned long g, unsigned long lo, unsigned long 
                 unsigned long l = q - LSTATE_GLOBAL;
                 if (plausible_state((unsigned char*)l, g, lo, hi))
                 {
+                    if (env_flag("WIEEN_CAPSCAN"))
+                    {
+                        static int shown;
+                        if (shown < 8)
+                        {
+                            shown++;
+                            wieen_log("wieen:   state %p has the capabilities "
+                                      "%#.x\n", (void*)l,
+                                      *(unsigned int*)((char*)l + LSTATE_CAPS));
+                        }
+                    }
                     found = 1;
                     break;
                 }
@@ -1006,6 +1043,7 @@ static void* selector_thread(void* arg)
                 g_global_state = g_candidates[i];
                 wieen_log("wieen: the state of the game is %p\n",
                           g_global_state);
+                collect_capabilities(g_candidates[i]);
                 return 0;
             }
             remove_preresume();
@@ -1030,6 +1068,66 @@ static void* selector_thread(void* arg)
  * has to run in the VM of the game, and the VM is only known once it has
  * answered the probe.
  */
+/*
+ * The states of the VM have different sets of capabilities: the thread of a
+ * script may create nothing, while the thread of the game creates
+ * instances.  The richest set of the VM is looked up here, so the thread
+ * of the agent is as capable as the game itself.
+ */
+static void collect_capabilities(unsigned char* g)
+{
+    const unsigned long chunk = 64UL << 20;
+    size_t pages = chunk >> 12;
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof(line), f))
+    {
+        unsigned long lo, hi;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3)
+            continue;
+        if (perms[0] != 'r' || perms[1] != 'w')
+            continue;
+        unsigned char* vec = malloc(pages);
+        if (!vec)
+            continue;
+        for (unsigned long base = lo; base < hi; base += chunk)
+        {
+            unsigned long len = hi - base < chunk ? hi - base : chunk;
+            if (mincore((void*)base, len, vec) != 0)
+                continue;
+            size_t npages = (len + 0xFFF) >> 12;
+            for (size_t p = 0; p < npages; p++)
+            {
+                if (!(vec[p] & 1))
+                    continue;
+                unsigned long page = base + (p << 12);
+                for (unsigned long q = page; q + 8 <= page + 4096; q += 8)
+                {
+                    if (*(unsigned long*)q != (unsigned long)g)
+                        continue;
+                    unsigned long l = q - LSTATE_GLOBAL;
+                    if (!plausible_state((unsigned char*)l, (unsigned long)g, lo, hi))
+                        continue;
+                    unsigned int caps =
+                        *(unsigned int*)((char*)l + LSTATE_CAPS);
+                    if (caps > g_rich_caps)
+                    {
+                        g_rich_caps = caps;
+                        wieen_log("wieen: the state %p has the capabilities "
+                                  "%#x\n", (void*)l, caps);
+                    }
+                }
+            }
+        }
+        free(vec);
+    }
+    fclose(f);
+    wieen_log("wieen: the richest set of capabilities is %#x\n", g_rich_caps);
+}
+
 static int ensure_preresume(void)
 {
     if (g_global_state)
@@ -1696,6 +1794,21 @@ static void* setup_thread(void* arg)
             g_tolstring = (fn_tolstring)at;
         else
             g_newthread = (fn_newthread)at;
+    }
+
+    /*
+     * The loader that Roblox wraps around luau_load refuses a bytecode
+     * blob of 280 bytes or more ("bytecode corrupted"), so the plain
+     * loader of another copy of Luau in the client can be tried instead:
+     * WIEEN_ALTLOAD=<offset of lua_load in the image>.
+     */
+    const char* alt = getenv("WIEEN_ALTLOAD");
+    if (alt && *alt)
+    {
+        unsigned long off = strtoul(alt, 0, 0);
+        g_load = (fn_load)((unsigned char*)g_base + off);
+        wieen_log("wieen: the loader is taken from %p (offset %#lx)\n",
+                  (void*)g_load, off);
     }
 
     if (!g_resume_addr || !g_load || !g_tolstring || !g_newthread)
