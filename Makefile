@@ -50,6 +50,7 @@ $(COMPILER): tools/wieen_compile.cpp tools/opcode_map.h
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) -O2 -o $@ $< \
 	    -I $(LUAU_DIR)/Compiler/include -I $(LUAU_DIR)/Common/include -I $(LUAU_DIR)/VM/include \
+	    -I $(LUAU_DIR)/Ast/include \
 	    $(LUAU_LIB)/libLuau.Compiler.a $(LUAU_LIB)/libLuau.Bytecode.a \
 	    $(LUAU_LIB)/libLuau.Ast.a $(LUAU_LIB)/libLuau.Common.a
 	@echo "built $@"

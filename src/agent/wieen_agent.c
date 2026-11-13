@@ -375,54 +375,13 @@ static void copy_result(char* out, size_t cap, size_t* outlen, const char* text,
 }
 
 /*
- * Runs the pending chunk in the given state.  The stack of the state is
- * restored afterwards, so the game does not notice that we were here.
+ * Runs one chunk of the script in the given state.  The stack of the state
+ * is restored afterwards, so the game does not notice that we were here.
  */
-static void run_pending(void* parent)
+static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
+                   const char** message, size_t* messagelen)
 {
-    size_t bclen;
-
-    if (env_flag("WIEEN_NOLOCKS") || env_flag("WIEEN_TAKEONLY") ||
-        env_flag("WIEEN_CLAIMNOREPLY"))
-    {
-        if (!__atomic_exchange_n(&g_pending_ready, 0, __ATOMIC_ACQ_REL) || !parent)
-            return;
-        bclen = g_pending_len;
-        if (env_flag("WIEEN_CLAIMNOREPLY"))
-        {
-            wieen_log("wieen: command claimed without completion notification\n");
-            return;
-        }
-        if (env_flag("WIEEN_TAKEONLY"))
-        {
-            snprintf(g_result, sizeof(g_result), "command claimed; no Luau or completion locks");
-            g_result_len = strlen(g_result);
-            pthread_mutex_lock(&g_lock);
-            g_finished = 1;
-            pthread_cond_signal(&g_done);
-            pthread_mutex_unlock(&g_lock);
-            return;
-        }
-    }
-    else
-    {
-        pthread_mutex_lock(&g_lock);
-        if (!g_pending_ready || !parent)
-        {
-            pthread_mutex_unlock(&g_lock);
-            return;
-        }
-        g_pending_ready = 0;
-        bclen = g_pending_len;
-        pthread_mutex_unlock(&g_lock);
-    }
-
-    static unsigned char chunk[MAX_MESSAGE];
-    memcpy(chunk, g_pending, bclen);
-
     /* The thread object on the parent stack roots our coroutine against GC. */
-    const char* message = 0;
-    size_t messagelen = 0;
     int status = -1;
     int loadstatus = -1;
     wieen_log("wieen: running a script after %lu resumes of the game\n",
@@ -472,8 +431,8 @@ static void run_pending(void* parent)
          */
         unsigned int caps =
             *(const unsigned int*)((const unsigned char*)parent + LSTATE_CAPS);
-        if (g_rich_caps > caps)
-            caps = g_rich_caps;
+        /* the sets of the threads are not nested, so they are united */
+        caps |= g_rich_caps;
         *(unsigned int*)((unsigned char*)thread + LSTATE_CAPS) = caps;
         wieen_log("wieen: the capabilities of the thread are %#.x\n", caps);
     }
@@ -501,11 +460,11 @@ static void run_pending(void* parent)
     wieen_log("wieen: created thread %p\n", thread);
 
     if (!thread)
-        message = "lua_newthread returned NULL";
+        *message = "lua_newthread returned NULL";
     else if (env_flag("WIEEN_NOLOAD"))
     {
-        message = "thread created; load skipped";
-        messagelen = strlen(message);
+        *message = "thread created; load skipped";
+        *messagelen = strlen(*message);
     }
     else
     {
@@ -526,8 +485,8 @@ static void run_pending(void* parent)
         if (status == 0 && env_flag("WIEEN_NORESUME"))
         {
             wieen_log("wieen: resume disabled by WIEEN_NORESUME\n");
-            message = "thread created and chunk loaded; resume skipped";
-            messagelen = strlen(message);
+            *message = "thread created and chunk loaded; resume skipped";
+            *messagelen = strlen(*message);
         }
         else if (status == 0)
         {
@@ -565,7 +524,7 @@ static void run_pending(void* parent)
                 if (++resumes > 10000)
                 {
                     status = -1;
-                    message = "the script yields over and over";
+                    *message = "the script yields over and over";
                     break;
                 }
             }
@@ -575,8 +534,10 @@ static void run_pending(void* parent)
                       resumes);
         }
         wieen_log("wieen: reading result\n");
-        message = g_tolstring(thread, -1, &messagelen);
-        if (!message)
+        size_t resultlen = 0;
+        *message = g_tolstring(thread, -1, &resultlen);
+        *messagelen = resultlen;
+        if (!*message)
         {
             /*
              * lua_tolstring only knows strings and numbers; for the
@@ -590,35 +551,152 @@ static void run_pending(void* parent)
                 static char other[64];
                 if (tag == 0)
                 {
-                    message = "nil";
+                    *message = "nil";
                 }
                 else if (tag == 1)
                 {
-                    message = (*(int*)value) ? "true" : "false";
+                    *message = (*(int*)value) ? "true" : "false";
                 }
                 else if (tag == 5)
                 {
-                    message = "table";
+                    *message = "table";
                 }
                 else if (tag == 6)
                 {
-                    message = "function";
+                    *message = "function";
                 }
                 else
                 {
                     snprintf(other, sizeof(other), "a value of type %d", tag);
-                    message = other;
+                    *message = other;
                 }
-                messagelen = strlen(message);
+                *messagelen = strlen(*message);
             }
         }
     }
 
     if (status == 1 && loadstatus == 0)
     {
-        message = "coroutine yielded; yielding scripts are not supported yet";
-        messagelen = strlen(message);
+        *message = "coroutine yielded; yielding scripts are not supported yet";
+        *messagelen = strlen(*message);
         status = -1;
+    }
+
+    /*
+     * Drop the thread from the parent's stack.  The pointer saved before
+     * lua_newthread cannot be used here: the call may grow the stack of
+     * the parent, which reallocates it, and writing the old pointer back
+     * would leave L->top pointing into memory that no longer belongs to
+     * the state - the client then dies some frames later, far from here.
+     * The slot is taken from the top as it is now instead.
+     */
+    if (pushed && !env_flag("WIEEN_LEAKTHREAD"))
+    {
+        char** top = (char**)((char*)parent + LSTATE_TOP);
+        if (*top && *top - 16 >= *(char**)((char*)parent + LSTATE_STACK))
+            *top -= 16;
+    }
+
+    return status;
+}
+
+
+/*
+ * A script that does not fit into the bytecode the client is willing to
+ * load comes in parts: the host splits it, every part is a chunk of its
+ * own, and the parts are run one after another in the same VM.
+ */
+#define MULTI_MAGIC "WIEENMUL"
+
+static unsigned long read_u32(const unsigned char* p)
+{
+    return (unsigned long)p[0] | ((unsigned long)p[1] << 8) |
+           ((unsigned long)p[2] << 16) | ((unsigned long)p[3] << 24);
+}
+
+/*
+ * Runs the pending chunk in the given state.  The stack of the state is
+ * restored afterwards, so the game does not notice that we were here.
+ */
+static void run_pending(void* parent)
+{
+    size_t bclen;
+
+    if (env_flag("WIEEN_NOLOCKS") || env_flag("WIEEN_TAKEONLY") ||
+        env_flag("WIEEN_CLAIMNOREPLY"))
+    {
+        if (!__atomic_exchange_n(&g_pending_ready, 0, __ATOMIC_ACQ_REL) || !parent)
+            return;
+        bclen = g_pending_len;
+        if (env_flag("WIEEN_CLAIMNOREPLY"))
+        {
+            wieen_log("wieen: command claimed without completion notification\n");
+            return;
+        }
+        if (env_flag("WIEEN_TAKEONLY"))
+        {
+            snprintf(g_result, sizeof(g_result), "command claimed; no Luau or completion locks");
+            g_result_len = strlen(g_result);
+            pthread_mutex_lock(&g_lock);
+            g_finished = 1;
+            pthread_cond_signal(&g_done);
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+    }
+    else
+    {
+        pthread_mutex_lock(&g_lock);
+        if (!g_pending_ready || !parent)
+        {
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+        g_pending_ready = 0;
+        bclen = g_pending_len;
+        pthread_mutex_unlock(&g_lock);
+    }
+
+    static unsigned char chunk[MAX_MESSAGE];
+    memcpy(chunk, g_pending, bclen);
+
+    const char* message = 0;
+    size_t messagelen = 0;
+    int status = -1;
+
+    if (bclen > 12 && memcmp(chunk, MULTI_MAGIC, 8) == 0)
+    {
+        size_t off = 8;
+        unsigned long count = read_u32(chunk + off);
+        off += 4;
+        wieen_log("wieen: the script comes in %lu parts\n", count);
+        for (unsigned long i = 0; i < count; i++)
+        {
+            if (off + 4 > bclen)
+            {
+                message = "the parts of the script are broken";
+                messagelen = strlen(message);
+                status = -1;
+                break;
+            }
+            unsigned long len = read_u32(chunk + off);
+            off += 4;
+            if (off + len > bclen)
+            {
+                message = "the parts of the script are broken";
+                messagelen = strlen(message);
+                status = -1;
+                break;
+            }
+            status = run_one(parent, chunk + off, len, &message, &messagelen);
+            off += len;
+            if (status != 0)
+                break;
+        }
+    }
+    else
+    {
+        status = run_one(parent, chunk, bclen, &message, &messagelen);
     }
 
     /* Copy while the Luau string is alive, then remove the thread reference. */
@@ -646,22 +724,7 @@ static void run_pending(void* parent)
     pthread_cond_signal(&g_done);
     pthread_mutex_unlock(&g_lock);
 
-    /*
-     * Drop the thread from the parent's stack.  The pointer saved before
-     * lua_newthread cannot be used here: the call may grow the stack of
-     * the parent, which reallocates it, and writing the old pointer back
-     * would leave L->top pointing into memory that no longer belongs to
-     * the state - the client then dies some frames later, far from here.
-     * The slot is taken from the top as it is now instead.
-     */
-    if (pushed && !env_flag("WIEEN_LEAKTHREAD"))
-    {
-        char** top = (char**)((char*)parent + LSTATE_TOP);
-        if (*top && *top - 16 >= *(char**)((char*)parent + LSTATE_STACK))
-            *top -= 16;
-    }
 }
-
 /*
  * The client runs more than one Luau VM, and only one of them is the one
  * the game itself uses.  The probe asks a VM what it can see: the game VM

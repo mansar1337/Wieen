@@ -20,6 +20,12 @@
 #include "luacode.h"
 #include "opcode_map.h"
 
+#include "Luau/Ast.h"
+#include "Luau/Lexer.h"
+#include "Luau/ParseOptions.h"
+#include "Luau/ParseResult.h"
+#include "Luau/Parser.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -237,6 +243,247 @@ bool translate_opcodes(char* bytecode, size_t size, std::string& error)
 
 }  // namespace
 
+/*
+ * The loader of the client takes bytecode of less than 280 bytes, so a
+ * script that does not fit is split into parts that do.  The parts are
+ * run one after another in the same VM.
+ */
+static const size_t kPartLimit = 279;
+
+static bool compile_source(const std::string& source, lua_CompileOptions options,
+                           bool keep_upstream, std::string& out, std::string& error)
+{
+    size_t size = 0;
+    lua_CompileOptions opts = options;
+    char* bytecode = luau_compile(source.data(), source.size(), &opts, &size);
+    if (!bytecode || !size)
+    {
+        error = "compilation failed";
+        return false;
+    }
+
+    /*
+     * The client numbers its opcodes differently, so the bytecode has to
+     * be translated before it is handed to the client's VM.
+     */
+    if (!keep_upstream && !translate_opcodes(bytecode, size, error))
+    {
+        free(bytecode);
+        return false;
+    }
+
+    out.assign(bytecode, size);
+    free(bytecode);
+    return true;
+}
+
+/* the byte offset of a place of the source */
+static size_t offset_of(const std::string& source, const Luau::Position& position)
+{
+    if (position.line == 0 || position.line == UINT_MAX)
+        return 0;
+    /* the lines of the parser start at zero */
+    size_t line = 0;
+    size_t offset = 0;
+    while (line < position.line && offset < source.size())
+    {
+        if (source[offset] == '\n')
+            line++;
+        offset++;
+    }
+    return offset + position.column;
+}
+
+/* the text of a place is replaced by spaces, so the positions stay */
+static void blank(std::string& text, size_t begin, size_t end)
+{
+    if (begin >= end || end > text.size())
+        return;
+    for (size_t i = begin; i < end; i++)
+        text[i] = ' ';
+}
+
+/*
+ * The top level locals of a script become globals, so the parts of a
+ * split script still share their state.
+ */
+static void make_globals(std::string& text, const Luau::ParseResult& result)
+{
+    for (Luau::AstStat* stat : result.root->body)
+    {
+        size_t begin = offset_of(text, stat->location.begin);
+        size_t end = offset_of(text, stat->location.end);
+        bool isLocal = false;
+
+        if (Luau::AstStatLocal* local = stat->as<Luau::AstStatLocal>())
+        {
+            if (local->values.size == 0)
+            {
+                /* a local without a value has nothing to do */
+                blank(text, begin, end);
+                continue;
+            }
+            isLocal = true;
+            for (Luau::AstLocal* var : local->vars)
+                if (var->annotation)
+                    blank(text, offset_of(text, var->annotation->location.begin),
+                          offset_of(text, var->annotation->location.end));
+        }
+        else if (stat->as<Luau::AstStatLocalFunction>())
+        {
+            isLocal = true;
+            Luau::AstStatLocalFunction* lf = stat->as<Luau::AstStatLocalFunction>();
+            if (lf->name->annotation)
+                blank(text, offset_of(text, lf->name->annotation->location.begin),
+                      offset_of(text, lf->name->annotation->location.end));
+        }
+
+        if (getenv("WIEEN_DEBUG"))
+            fprintf(stderr, "wieen-compile: local %d at %zu: [%s]\n", (int)isLocal, begin,
+                    text.substr(begin, 8).c_str());
+        if (isLocal && text.compare(begin, 5, "local") == 0)
+            blank(text, begin, begin + 5);
+    }
+}
+
+/*
+ * Splits the script into parts that the client is able to load.  The
+ * parts are the top level statements, grouped so that every part fits
+ * into the limit of the loader.
+ */
+static bool split_script(const std::string& source, lua_CompileOptions options,
+                         bool keep_upstream, std::vector<std::string>& parts,
+                         std::string& error)
+{
+    Luau::Allocator allocator;
+    Luau::AstNameTable names(allocator);
+    Luau::ParseOptions parseOptions;
+    Luau::ParseResult result =
+        Luau::Parser::parse(source.data(), source.size(), names, allocator, parseOptions);
+    if (!result.errors.empty())
+    {
+        error = result.errors[0].getMessage();
+        return false;
+    }
+
+    std::string text = source;
+    make_globals(text, result);
+
+    if (getenv("WIEEN_DEBUG"))
+    {
+        for (Luau::AstStat* stat : result.root->body)
+            fprintf(stderr, "wieen-compile: statement %u:%u..%u:%u\n",
+                    stat->location.begin.line, stat->location.begin.column,
+                    stat->location.end.line, stat->location.end.column);
+    }
+
+    size_t partBegin = 0;
+    size_t partEnd = 0;
+    bool haveStatement = false;
+
+    for (Luau::AstStat* stat : result.root->body)
+    {
+        size_t end = offset_of(text, stat->location.end);
+
+        std::string piece = text.substr(partBegin, end - partBegin);
+        std::string bytes;
+        if (!compile_source(piece, options, keep_upstream, bytes, error))
+            return false;
+        if (bytes.size() > kPartLimit)
+        {
+            /* without the information about the lines the part is smaller */
+            lua_CompileOptions plain = options;
+            plain.debugLevel = 0;
+            std::string smaller;
+            if (compile_source(piece, plain, keep_upstream, smaller, error) &&
+                smaller.size() < bytes.size())
+            {
+                bytes = smaller;
+                options = plain;
+            }
+        }
+
+        if (bytes.size() > kPartLimit)
+        {
+            if (getenv("WIEEN_DEBUG"))
+                fprintf(stderr, "wieen-compile: the part of %lu bytes is too big\n",
+                        (unsigned long)bytes.size());
+            if (haveStatement)
+            {
+                /* the part ends before this statement */
+                std::string done;
+                if (!compile_source(text.substr(partBegin, partEnd - partBegin),
+                                    options, keep_upstream, done, error))
+                    return false;
+                parts.push_back(done);
+                partBegin = partEnd;
+                haveStatement = false;
+                piece = text.substr(partBegin, end - partBegin);
+                if (!compile_source(piece, options, keep_upstream, bytes, error))
+                    return false;
+                if (bytes.size() > kPartLimit)
+                {
+                    lua_CompileOptions plain = options;
+                    plain.debugLevel = 0;
+                    std::string smaller;
+                    if (compile_source(piece, plain, keep_upstream, smaller, error) &&
+                        smaller.size() < bytes.size())
+                    {
+                        bytes = smaller;
+                        options = plain;
+                    }
+                }
+            }
+            if (bytes.size() > kPartLimit)
+            {
+                if (getenv("WIEEN_DEBUG"))
+                    fprintf(stderr, "wieen-compile: the statement is too big:\n---8<---\n%s\n---8<---\n",
+                            piece.c_str());
+                error = "the statement is too big for the loader of the client";
+                return false;
+            }
+        }
+
+        haveStatement = true;
+        partEnd = end;
+
+        if (stat->is<Luau::AstStatReturn>())
+            break;
+    }
+
+    if (haveStatement)
+    {
+        std::string done;
+        if (!compile_source(text.substr(partBegin, partEnd - partBegin), options,
+                            keep_upstream, done, error))
+            return false;
+        parts.push_back(done);
+    }
+
+    return true;
+}
+
+/*
+ * The framing of a script that comes in parts: the magic, the number of
+ * the parts, and then the length and the bytes of every part.
+ */
+static std::string frame_parts(const std::vector<std::string>& parts)
+{
+    std::string out = "WIEENMUL";
+    unsigned long count = (unsigned long)parts.size();
+    for (int i = 0; i < 4; i++)
+        out += (char)((count >> (8 * i)) & 0xff);
+    for (const std::string& part : parts)
+    {
+        unsigned long len = (unsigned long)part.size();
+        for (int i = 0; i < 4; i++)
+            out += (char)((len >> (8 * i)) & 0xff);
+        out += part;
+    }
+    return out;
+}
+
+
 int main(int argc, char** argv)
 {
     std::string source;
@@ -285,7 +532,6 @@ int main(int argc, char** argv)
         wrapped = source;
     }
 
-    size_t size = 0;
     lua_CompileOptions options;
     memset(&options, 0, sizeof(options));
     options.optimizationLevel = 1;
@@ -293,17 +539,7 @@ int main(int argc, char** argv)
     for (int i = 2; i < argc; i++)
         if (strcmp(argv[i], "--nodebug") == 0)
             options.debugLevel = 0;
-    char* bytecode = luau_compile(wrapped.data(), wrapped.size(), &options, &size);
-    if (!bytecode || !size)
-    {
-        fprintf(stderr, "wieen-compile: compilation failed\n");
-        return 1;
-    }
 
-    /*
-     * The client numbers its opcodes differently, so the bytecode has to
-     * be translated before it is handed to the client's VM.
-     */
     bool keep_upstream = false;
     for (int i = 2; i < argc; i++)
     {
@@ -312,14 +548,31 @@ int main(int argc, char** argv)
     }
 
     std::string error;
-    if (!keep_upstream && !translate_opcodes(bytecode, size, error))
+    std::string bytes;
+    if (!compile_source(wrapped, options, keep_upstream, bytes, error))
     {
-        fprintf(stderr, "wieen-compile: cannot translate the opcodes: %s\n", error.c_str());
-        free(bytecode);
+        fprintf(stderr, "wieen-compile: %s\n", error.c_str());
         return 1;
     }
 
-    fwrite(bytecode, 1, size, stdout);
-    free(bytecode);
+    if (bytes.size() <= kPartLimit)
+    {
+        fwrite(bytes.data(), 1, bytes.size(), stdout);
+        return 0;
+    }
+
+    /*
+     * The script does not fit into the bytecode the client is willing to
+     * load, so it is split into parts that do.
+     */
+    std::vector<std::string> parts;
+    if (!split_script(source, options, keep_upstream, parts, error))
+    {
+        fprintf(stderr, "wieen-compile: cannot split the script: %s\n", error.c_str());
+        return 1;
+    }
+
+    std::string framed = frame_parts(parts);
+    fwrite(framed.data(), 1, framed.size(), stdout);
     return 0;
 }
