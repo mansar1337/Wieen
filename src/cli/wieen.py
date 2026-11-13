@@ -121,7 +121,7 @@ def preload_hint() -> str:
 class Agent:
     """Client for the agent's socket protocol: [u32 len][payload]."""
 
-    def __init__(self, path: Path | None = None, timeout: float = 10.0):
+    def __init__(self, path: Path | None = None, timeout: float = 150.0):
         self.path = path or socket_path()
         self.timeout = timeout
         self.sock: socket.socket | None = None

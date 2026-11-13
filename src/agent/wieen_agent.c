@@ -141,6 +141,8 @@ static unsigned long g_base;
 #define LSTATE_BASECALLS 0x0a
 #define LSTATE_STATUS 0x03
 #define LSTATE_ACTIVE 0x06
+/* the set of capabilities of Roblox for the thread */
+#define LSTATE_CAPS 0x0c
 
 /* ------------------------------------------------------------------ */
 /* logging                                                            */
@@ -438,6 +440,37 @@ static void run_pending(void* parent)
             *(void**)((char*)*(void**)((char*)parent + LSTATE_GLOBAL) + 0x6a0) = userthread;
     }
     int pushed = thread != 0;
+
+    if (thread && env_flag("WIEEN_CAPDIFF"))
+    {
+        /* The capabilities of a thread live somewhere in its state: the
+         * bytes that differ between the thread of the game and ours are
+         * printed, so the field can be found. */
+        wieen_log("wieen: the bytes that differ between the parent and the "
+                  "thread:\n");
+        for (int off = 0; off < 0x20; off++)
+        {
+            unsigned char a = ((unsigned char*)parent)[off];
+            unsigned char b = ((unsigned char*)thread)[off];
+            if (a != b)
+                wieen_log("wieen:   +%#x: parent=%#x thread=%#x\n", off, a, b);
+        }
+    }
+
+    if (thread)
+    {
+        /*
+         * Roblox keeps a set of capabilities for every thread: a thread
+         * without them is not allowed to touch an instance, and the
+         * sandbox says "lacking capability Basic".  A thread that the
+         * agent makes has none, so the set of the thread of the game is
+         * copied into it: the mask lives at +0x0c of the state.
+         */
+        unsigned int caps =
+            *(const unsigned int*)((const unsigned char*)parent + LSTATE_CAPS);
+        *(unsigned int*)((unsigned char*)thread + LSTATE_CAPS) = caps;
+        wieen_log("wieen: the capabilities of the thread are %#.x\n", caps);
+    }
 
     wieen_log("wieen: created thread %p\n", thread);
 
@@ -863,11 +896,15 @@ static unsigned char* find_global_state(void)
         0x41, 0x54, 0x53, 0x50, 0x49, 0x89, 0xf6, 0x49, 0x89, 0xfc,
     };
     unsigned long needle = g_base + 0x22e260bUL;
+    static int said;
     int have_needle =
         memcmp((void*)needle, SIG_USERTHREAD, sizeof(SIG_USERTHREAD)) == 0;
-    if (have_needle)
+    if (have_needle && !said)
+    {
+        said = 1;
         wieen_log("wieen: userthread callback at %p matches the signature\n",
                   (void*)needle);
+    }
 
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f)
@@ -936,7 +973,10 @@ static void* selector_thread(void* arg)
     {
         if (!g_candidate_count && !find_global_state())
         {
-            usleep(500000);
+            /* The VM of the game is not there yet: it is created while the
+             * client starts, and the search is expensive, so it waits a
+             * little before it looks again. */
+            usleep(2000000);
             continue;
         }
         for (int i = 0; i < g_candidate_count; i++)

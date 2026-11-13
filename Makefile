@@ -58,7 +58,11 @@ $(COMPILER): tools/wieen_compile.cpp tools/opcode_map.h
 # before Sober is started again
 deploy: agent
 	@mkdir -p $(SOBER_DATA)
-	cp $(AGENT) $(SOBER_DATA)/wieen_agent.so
+	@# a copy over the running file kills the client with SIGBUS: the old
+	@# library is mapped, and rewriting it in place breaks the mapping.  A
+	@# new file and a rename leave the running process alone.
+	cp $(AGENT) $(SOBER_DATA)/wieen_agent.so.new
+	mv $(SOBER_DATA)/wieen_agent.so.new $(SOBER_DATA)/wieen_agent.so
 	@echo "agent deployed to $(SOBER_DATA)/wieen_agent.so"
 	@echo "restart Sober for it to take effect"
 
