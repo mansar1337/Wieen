@@ -89,9 +89,10 @@ def main() -> int:
         subprocess.run(["flatpak", "kill", "org.vinegarhq.Sober"], capture_output=True)
         time.sleep(2)
         log = open(LOG, "wb")
-        proc = subprocess.Popen(["flatpak", "run", "org.vinegarhq.Sober"],
-                                stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-                                start_new_session=True)
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO / "src/cli/wieen.py"), "launch"],
+            stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+            start_new_session=True)
         sock = connect(time.time() + 60)
         if not sock:
             print(f"attempt {attempt}: the agent never showed up")

@@ -10,14 +10,19 @@
  *   - finds the client image in its own address space,
  *   - locates the Luau VM's entry points by their code signature, so the
  *     agent keeps working when the client is updated,
- *   - hooks lua_resume, which hands us the game's own lua_State whenever
- *     the game runs a script,
+ *   - finds the state of the game's Luau VM (global_State) and puts its own
+ *     handler into the pre-resume slot of that state, which the VM calls
+ *     before every script the game runs,
  *   - serves a UNIX socket: the host sends a compiled Luau chunk, the
  *     agent runs it inside the game's VM and returns the result.
  *
- * The code always runs on the game's script thread, inside the hook of
- * lua_resume, because a Luau state must not be touched from another
- * thread.
+ * The code of the client is never touched: the client checks the bytes of
+ * its own text about a minute after the start and leaves when they do not
+ * match, so a hook in the code is not an option.  The handler lives in the
+ * writable memory of the state of Luau, which that check does not see.
+ *
+ * The code always runs on the game's script thread, inside that handler,
+ * because a Luau state must not be touched from another thread.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -34,6 +39,9 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+/* the bytecode of the probe, compiled by tools/probe.luau */
+#include "probe_bytecode.h"
 
 #define LOG_DIR_SUFFIX "/.var/app/org.vinegarhq.Sober/data/wieen"
 #define LOG_FILE_NAME "agent.log"
@@ -176,7 +184,6 @@ static int g_pending_ready;
 static int g_finished;
 static char g_result[MAX_MESSAGE];
 static size_t g_result_len;
-static __thread int g_in_hook;
 
 /* ------------------------------------------------------------------ */
 /* the hook                                                           */
@@ -192,10 +199,22 @@ static int env_flag(const char* name)
     return v && *v && strcmp(v, "0") != 0;
 }
 
-static unsigned long g_hits;
-static void* g_trampoline;
-static void wieen_on_resume(void* L, void* from, long nargs);
-static void (*g_handler)(void*, void*, long) = wieen_on_resume;
+static void run_pending(void* parent);
+static void run_probe(void* L);
+
+/*
+ * The state of the game and the callback that is put into it.  The
+ * callback lives in the writable memory of the client, so the check of
+ * the integrity of the code does not see it.
+ */
+static void* g_global_state;         /* the state of the VM we settled on */
+static unsigned char* g_installed_g;  /* where our callback is installed */
+static void* g_installed_original;    /* the callback that was there */
+static unsigned long g_preresume_hits;
+static int g_in_preresume;            /* a script of ours is running */
+static int g_probe_wanted;            /* the next hit has to be probed */
+static int g_probe_done;
+static char g_probe_result[160];
 
 /* ------------------------------------------------------------------ */
 /* a small view of the memory map                                     */
@@ -357,15 +376,40 @@ static void run_pending(void* parent)
 {
     size_t bclen;
 
-    pthread_mutex_lock(&g_lock);
-    if (!g_pending_ready || !parent)
+    if (env_flag("WIEEN_NOLOCKS") || env_flag("WIEEN_TAKEONLY") ||
+        env_flag("WIEEN_CLAIMNOREPLY"))
     {
-        pthread_mutex_unlock(&g_lock);
-        return;
+        if (!__atomic_exchange_n(&g_pending_ready, 0, __ATOMIC_ACQ_REL) || !parent)
+            return;
+        bclen = g_pending_len;
+        if (env_flag("WIEEN_CLAIMNOREPLY"))
+        {
+            wieen_log("wieen: command claimed without completion notification\n");
+            return;
+        }
+        if (env_flag("WIEEN_TAKEONLY"))
+        {
+            snprintf(g_result, sizeof(g_result), "command claimed; no Luau or completion locks");
+            g_result_len = strlen(g_result);
+            pthread_mutex_lock(&g_lock);
+            g_finished = 1;
+            pthread_cond_signal(&g_done);
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
     }
-    g_pending_ready = 0;
-    bclen = g_pending_len;
-    pthread_mutex_unlock(&g_lock);
+    else
+    {
+        pthread_mutex_lock(&g_lock);
+        if (!g_pending_ready || !parent)
+        {
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+        g_pending_ready = 0;
+        bclen = g_pending_len;
+        pthread_mutex_unlock(&g_lock);
+    }
 
     static unsigned char chunk[MAX_MESSAGE];
     memcpy(chunk, g_pending, bclen);
@@ -374,24 +418,59 @@ static void run_pending(void* parent)
     const char* message = 0;
     size_t messagelen = 0;
     int status = -1;
-    wieen_log("wieen: running a script after %lu calls of lua_resume\n", g_hits);
+    int loadstatus = -1;
+    wieen_log("wieen: running a script after %lu resumes of the game\n",
+              g_preresume_hits);
     wieen_log("wieen: creating thread for %lu bytes in parent %p\n",
               (unsigned long)bclen, parent);
-    void* thread = g_newthread(parent);
+    void* userthread = 0;
+    void* thread = 0;
+    if (!env_flag("WIEEN_NOTHREAD"))
+    {
+        if (env_flag("WIEEN_NOUSERTHREAD"))
+        {
+            void** cb = (void**)((char*)*(void**)((char*)parent + LSTATE_GLOBAL) + 0x6a0);
+            userthread = *cb;
+            *cb = 0;
+        }
+        thread = g_newthread(parent);
+        if (env_flag("WIEEN_NOUSERTHREAD"))
+            *(void**)((char*)*(void**)((char*)parent + LSTATE_GLOBAL) + 0x6a0) = userthread;
+    }
     int pushed = thread != 0;
 
     wieen_log("wieen: created thread %p\n", thread);
 
     if (!thread)
         message = "lua_newthread returned NULL";
+    else if (env_flag("WIEEN_NOLOAD"))
+    {
+        message = "thread created; load skipped";
+        messagelen = strlen(message);
+    }
     else
     {
         status = g_load(thread, "=wieen", (const char*)chunk, bclen, 0);
+        loadstatus = status;
         wieen_log("wieen: luau_load returned %d\n", status);
+        if (status != 0)
+        {
+            /* The compiler left its complaint on the stack: read it. */
+            size_t errlen = 0;
+            const char* err = g_tolstring(thread, -1, &errlen);
+            wieen_log("wieen: the compiler says: %s\n",
+                      err ? err : "(nothing on the stack)");
+        }
         char* top = *(char**)((char*)thread + LSTATE_TOP);
         wieen_log("wieen: loaded %lu bytes, the function is at %p\n",
                   (unsigned long)bclen, top - 16);
-        if (status == 0)
+        if (status == 0 && env_flag("WIEEN_NORESUME"))
+        {
+            wieen_log("wieen: resume disabled by WIEEN_NORESUME\n");
+            message = "thread created and chunk loaded; resume skipped";
+            messagelen = strlen(message);
+        }
+        else if (status == 0)
         {
             /*
              * The thread now has the loaded function on its stack, so
@@ -476,7 +555,7 @@ static void run_pending(void* parent)
         }
     }
 
-    if (status == 1)
+    if (status == 1 && loadstatus == 0)
     {
         message = "coroutine yielded; yielding scripts are not supported yet";
         messagelen = strlen(message);
@@ -516,7 +595,7 @@ static void run_pending(void* parent)
      * the state - the client then dies some frames later, far from here.
      * The slot is taken from the top as it is now instead.
      */
-    if (pushed)
+    if (pushed && !env_flag("WIEEN_LEAKTHREAD"))
     {
         char** top = (char**)((char*)parent + LSTATE_TOP);
         if (*top && *top - 16 >= *(char**)((char*)parent + LSTATE_STACK))
@@ -525,31 +604,402 @@ static void run_pending(void* parent)
 }
 
 /*
- * The hook fires thousands of times a second, so a call that finds nothing
- * to run has to cost almost nothing: no lock, no reading of the state, no
- * file.  Everything that is expensive happens only when a script waits.
+ * The client runs more than one Luau VM, and only one of them is the one
+ * the game itself uses.  The probe asks a VM what it can see: the game VM
+ * knows `game` and `workspace`, the other ones do not.
  */
-static void wieen_on_resume(void* L, void* from, long nargs)
+static void run_probe(void* L)
 {
-    /*
-     * One counter, so the log says how busy the hook is: a fault that
-     * arrives after a fixed number of calls and one that arrives after a
-     * fixed time are two different things.
-     */
-    if ((__atomic_add_fetch(&g_hits, 1, __ATOMIC_RELAXED) & 0x3FFFF) == 0)
-        wieen_log("wieen: lua_resume hit %lu\n", g_hits);
+    static char saved[MAX_MESSAGE];
+    static char savedresult[MAX_MESSAGE];
+    size_t savedlen = 0, savedresultlen = 0;
+    int savedready = 0, savedfinished = 0;
 
-    if (!__atomic_load_n(&g_pending_ready, __ATOMIC_RELAXED))
+    pthread_mutex_lock(&g_lock);
+    savedlen = g_pending_len;
+    savedready = g_pending_ready;
+    savedfinished = g_finished;
+    savedresultlen = g_result_len;
+    if (g_pending_len && g_pending_len < sizeof(saved))
+        memcpy(saved, g_pending, g_pending_len);
+    if (g_result_len && g_result_len < sizeof(savedresult))
+        memcpy(savedresult, g_result, g_result_len);
+    memcpy(g_pending, wieen_probe, wieen_probe_size);
+    g_pending_len = wieen_probe_size;
+    g_pending_ready = 1;
+    g_finished = 0;
+    pthread_mutex_unlock(&g_lock);
+
+    run_pending(L);
+
+    pthread_mutex_lock(&g_lock);
+    snprintf(g_probe_result, sizeof(g_probe_result), "%.*s",
+             (int)sizeof(g_probe_result) - 1, g_result);
+    if (savedlen && savedlen < sizeof(saved))
+    {
+        memcpy(g_pending, saved, savedlen);
+        g_pending_len = savedlen;
+    }
+    if (savedresultlen && savedresultlen < sizeof(savedresult))
+        memcpy(g_result, savedresult, savedresultlen);
+    g_result_len = savedresultlen;
+    g_pending_ready = savedready;
+    g_finished = savedfinished;
+    pthread_mutex_unlock(&g_lock);
+
+    wieen_log("wieen: the VM at %p says %s\n", g_installed_g, g_probe_result);
+}
+
+/*
+ * The pre-resume callback in the global state.  Unlike a patch of the text,
+ * this pointer lives in writable memory, so the integrity check of the
+ * client does not see it.  It is called from lua_resume on the game thread,
+ * which is exactly the context a script needs.
+ */
+static void wieen_preresume(void* L)
+{
+    if (g_in_preresume)
+    {
+        if (g_installed_original)
+            ((void (*)(void*))g_installed_original)(L);
         return;
-    if (g_in_hook)
+    }
+    g_in_preresume = 1;
+    __atomic_add_fetch(&g_preresume_hits, 1, __ATOMIC_RELAXED);
+    if (g_installed_original)
+        ((void (*)(void*))g_installed_original)(L);
+    if (g_probe_wanted)
+    {
+        g_probe_wanted = 0;
+        g_probe_done = 1;
+        run_probe(L);
+    }
+    else if (__atomic_load_n(&g_pending_ready, __ATOMIC_RELAXED))
+    {
+        if (state_is_usable(L))
+            run_pending(L);
+        else
+            wieen_log("wieen: that state does not look like a Luau state (%s), "
+                      "skipping\n", state_problem(L));
+    }
+    g_in_preresume = 0;
+}
+
+/*
+ * Every executable mapping of the client, collected when the image is
+ * identified.  A pointer into the client's code has to be checked against
+ * all of them: the client patches and splits its text at runtime, so the
+ * mapping that holds lua_resume is not the only one and is not the whole
+ * of the code.
+ */
+#define IMAGE_SPAN 0x10000000UL
+#define MAX_TEXT_RANGES 8
+static unsigned long g_text_lo[MAX_TEXT_RANGES];
+static unsigned long g_text_hi[MAX_TEXT_RANGES];
+static int g_text_count;
+
+static int in_client_text(unsigned long p)
+{
+    for (int i = 0; i < g_text_count; i++)
+        if (p >= g_text_lo[i] && p < g_text_hi[i])
+            return 1;
+    return 0;
+}
+
+/*
+ * The state of a VM has the callback of Roblox in it, the two hooks of
+ * Luau around it and a small counter behind them.  A piece of memory
+ * that only looks like that is not the state of a VM.
+ */
+static int looks_like_global_state(unsigned char* g, unsigned long lo, unsigned long hi)
+{
+    if ((unsigned long)g < lo || (unsigned long)g + 0x720 > hi)
+        return 0;
+    unsigned long userthread = *(unsigned long*)(g + 0x6a0);
+    if (!in_client_text(userthread))
+        return 0;
+    unsigned long pre = *(unsigned long*)(g + 0x678);
+    unsigned long post = *(unsigned long*)(g + 0x650);
+    if (pre && !in_client_text(pre))
+        return 0;
+    if (post && !in_client_text(post))
+        return 0;
+    unsigned long marker = *(unsigned long*)(g + 0x6b0);
+    if (marker > 0x10000)
+        return 0;
+    return 1;
+}
+
+static int plausible_state(unsigned char* L, unsigned long g,
+                           unsigned long lo, unsigned long hi)
+{
+    if ((unsigned long)L < lo || (unsigned long)L + 0x60 > hi)
+        return 0;
+    if (*(unsigned long*)(L + LSTATE_GLOBAL) != g)
+        return 0;
+    unsigned long stack = *(unsigned long*)(L + LSTATE_STACK);
+    unsigned long top = *(unsigned long*)(L + LSTATE_TOP);
+    unsigned long base = *(unsigned long*)(L + LSTATE_BASE);
+    if (!stack || !top || !base)
+        return 0;
+    if (top < stack || top - stack > 0x1000000)
+        return 0;
+    if (base < stack || base > top + 0x10000)
+        return 0;
+    return 1;
+}
+
+static int has_state_reference(unsigned long g, unsigned long lo, unsigned long hi)
+{
+    const unsigned long chunk = 64UL << 20;
+    size_t pages = chunk >> 12;
+    unsigned char* vec = malloc(pages);
+    if (!vec)
+        return 0;
+    int found = 0;
+    for (unsigned long base = lo; base < hi && !found; base += chunk)
+    {
+        unsigned long len = hi - base < chunk ? hi - base : chunk;
+        if (mincore((void*)base, len, vec) != 0)
+            continue;
+        size_t npages = (len + 0xFFF) >> 12;
+        for (size_t p = 0; p < npages && !found; p++)
+        {
+            if (!(vec[p] & 1))
+                continue;
+            unsigned long page = base + (p << 12);
+            for (unsigned long q = page; q + 8 <= page + 4096; q += 8)
+            {
+                if (*(unsigned long*)q != g)
+                    continue;
+                unsigned long l = q - LSTATE_GLOBAL;
+                if (plausible_state((unsigned char*)l, g, lo, hi))
+                {
+                    found = 1;
+                    break;
+                }
+            }
+        }
+    }
+    free(vec);
+    return found;
+}
+
+/*
+ * Several Luau VMs live in the client and each of them has its own global
+ * state, so the search collects every candidate instead of the first one.
+ * The state of the VM the game actually runs its scripts in is the one
+ * whose pre-resume slot is reached; the others are tried in turn.
+ */
+#define MAX_CANDIDATES 16
+static unsigned char* g_candidates[MAX_CANDIDATES];
+static int g_candidate_count;
+
+static void dump_candidate(unsigned char* g)
+{
+    wieen_log("wieen: candidate g=%p cb[0x650]=%#lx cb[0x678]=%#lx "
+              "cb[0x6a0]=%#lx cb[0x6b0]=%#lx\n",
+              g, *(unsigned long*)(g + 0x650), *(unsigned long*)(g + 0x678),
+              *(unsigned long*)(g + 0x6a0), *(unsigned long*)(g + 0x6b0));
+}
+
+/* Scan resident pages only: the mimalloc arena reserves a gigabyte and
+ * most of it is untouched, and faulting all of it in just to read zeros
+ * would cost more than the search. */
+static unsigned char* scan_region(unsigned long lo, unsigned long hi,
+                                  unsigned long anchor)
+{
+    const unsigned long chunk = 64UL << 20;
+    size_t pages = chunk >> 12;
+    unsigned char* vec = malloc(pages);
+    if (!vec)
+        return 0;
+    unsigned char* found = 0;
+    for (unsigned long base = lo; base < hi; base += chunk)
+    {
+        unsigned long len = hi - base < chunk ? hi - base : chunk;
+        if (mincore((void*)base, len, vec) != 0)
+            continue;
+        size_t npages = (len + 0xFFF) >> 12;
+        for (size_t p = 0; p < npages; p++)
+        {
+            if (!(vec[p] & 1))
+                continue;
+            unsigned long page = base + (p << 12);
+            for (unsigned long q = page; q + 8 <= page + 4096; q += 8)
+            {
+                unsigned long v = *(unsigned long*)q;
+                int hit = anchor ? v == anchor : in_client_text(v);
+                if (!hit)
+                    continue;
+                unsigned long g = q - 0x6a0;
+                if (!looks_like_global_state((unsigned char*)g, lo, hi) ||
+                    !has_state_reference(g, lo, hi))
+                    continue;
+                if (!found)
+                    found = (unsigned char*)g;
+                if (g_candidate_count < MAX_CANDIDATES)
+                    g_candidates[g_candidate_count++] = (unsigned char*)g;
+            }
+        }
+    }
+    free(vec);
+    return found;
+}
+
+static unsigned char* find_global_state(void)
+{
+    if (!g_text_count)
+        return 0;
+
+    /*
+     * In this client the userthread callback Roblox stores at g+0x6a0 is
+     * the function at base+0x22e260b.  Use it as a needle when the code
+     * there still matches; otherwise fall back to any pointer into the
+     * client text, which is a much broader but still usable search.
+     */
+    static const unsigned char SIG_USERTHREAD[] = {
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+        0x41, 0x54, 0x53, 0x50, 0x49, 0x89, 0xf6, 0x49, 0x89, 0xfc,
+    };
+    unsigned long needle = g_base + 0x22e260bUL;
+    int have_needle =
+        memcmp((void*)needle, SIG_USERTHREAD, sizeof(SIG_USERTHREAD)) == 0;
+    if (have_needle)
+        wieen_log("wieen: userthread callback at %p matches the signature\n",
+                  (void*)needle);
+
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return 0;
+    char line[512];
+    unsigned char* found = 0;
+    while (fgets(line, sizeof(line), f))
+    {
+        unsigned long lo, hi;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3)
+            continue;
+        if (perms[0] != 'r' || perms[1] != 'w')
+            continue;
+        unsigned char* r = scan_region(lo, hi, have_needle ? needle : 0);
+        if (r && !found)
+            found = r;
+        if (found && g_candidate_count >= MAX_CANDIDATES)
+            break;
+    }
+    fclose(f);
+    for (int i = 0; i < g_candidate_count; i++)
+        dump_candidate(g_candidates[i]);
+    return found;
+}
+
+/*
+ * The callback is put into the pre-resume slot of a global state and taken
+ * out again when the state turns out to be the wrong one.
+ */
+static void remove_preresume(void)
+{
+    if (!g_installed_g)
         return;
-    g_in_hook = 1;
-    if (state_is_usable(L))
-        run_pending(L);
-    else
-        wieen_log("wieen: that state does not look like a Luau state (%s), skipping\n",
-                  state_problem(L));
-    g_in_hook = 0;
+    __atomic_store_n((void**)(g_installed_g + 0x678), g_installed_original,
+                     __ATOMIC_RELEASE);
+    wieen_log("wieen: the callback is taken out of %p\n", g_installed_g);
+    g_installed_g = 0;
+    g_installed_original = 0;
+}
+
+static int install_preresume(unsigned char* g)
+{
+    if (g_installed_g == g)
+        return 1;
+    remove_preresume();
+    g_installed_original = *(void**)(g + 0x678);
+    __atomic_store_n((void**)(g + 0x678), (void*)wieen_preresume,
+                     __ATOMIC_RELEASE);
+    g_installed_g = g;
+    wieen_log("wieen: global state at %p, preresume %p -> %p\n", g,
+              g_installed_original, (void*)wieen_preresume);
+    return 1;
+}
+
+/*
+ * The client holds several Luau VMs, each with its own global state, and
+ * only one of them belongs to the game.  A VM that never resumes anything
+ * is not the one we are after; a VM that does is asked what it can see.
+ */
+static void* selector_thread(void* arg)
+{
+    (void)arg;
+    unsigned char* live = 0;
+    for (int round = 0; round < 30 && !g_global_state; round++)
+    {
+        if (!g_candidate_count && !find_global_state())
+        {
+            usleep(500000);
+            continue;
+        }
+        for (int i = 0; i < g_candidate_count; i++)
+        {
+            if (g_global_state)
+                break;
+            install_preresume(g_candidates[i]);
+            unsigned long before = g_preresume_hits;
+            for (int t = 0; t < 50 && g_preresume_hits == before; t++)
+                usleep(100000);
+            if (g_preresume_hits == before)
+            {
+                wieen_log("wieen: the VM at %p does not resume anything\n",
+                          g_candidates[i]);
+                continue;
+            }
+            if (!live)
+                live = g_candidates[i];
+            g_probe_wanted = 1;
+            g_probe_done = 0;
+            for (int t = 0; t < 50 && !g_probe_done; t++)
+                usleep(100000);
+            wieen_log("wieen: the VM at %p says %s\n", g_candidates[i],
+                      g_probe_result);
+            if (strstr(g_probe_result, "Instance"))
+            {
+                g_global_state = g_candidates[i];
+                wieen_log("wieen: the state of the game is %p\n",
+                          g_global_state);
+                return 0;
+            }
+            remove_preresume();
+        }
+        if (live && !g_global_state)
+        {
+            /* None of the VMs answered the probe, so the one that runs is
+             * taken: it is the only one that resumes anything. */
+            install_preresume(live);
+            g_global_state = live;
+            wieen_log("wieen: the state in use is %p\n", g_global_state);
+            return 0;
+        }
+        usleep(500000);
+    }
+    wieen_log("wieen: no state of the game was found\n");
+    return 0;
+}
+
+/*
+ * The socket waits for the selection when a command comes in: the script
+ * has to run in the VM of the game, and the VM is only known once it has
+ * answered the probe.
+ */
+static int ensure_preresume(void)
+{
+    if (g_global_state)
+        return 1;
+    for (int i = 0; i < 600 && !g_global_state; i++)
+        usleep(100000);
+    if (g_global_state)
+        return 1;
+    wieen_log("wieen: could not find the global state of Luau\n");
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -774,14 +1224,6 @@ static unsigned long long hash_image(unsigned long base, unsigned long size)
 }
 
 /*
- * How far from the base a mapping may start and still belong to the
- * client image.  The image is around a hundred megabytes, so a quarter of
- * a gigabyte is safely outside of any other library.
- */
-#define IMAGE_SPAN 0x10000000UL
-#define MAX_TEXT_RANGES 8
-
-/*
  * The client is not mapped as one readable blob: the loader keeps the ELF
  * header on a read-only page and starts the text a page or two later, and
  * the client itself calls mprotect on the parts it patches at runtime.
@@ -790,10 +1232,6 @@ static unsigned long long hash_image(unsigned long base, unsigned long size)
  * 4 KiB to 16 KiB pages.  So the agent keeps every executable mapping of
  * the image and looks the signatures up in all of them.
  */
-static unsigned long g_text_lo[MAX_TEXT_RANGES];
-static unsigned long g_text_hi[MAX_TEXT_RANGES];
-static int g_text_count;
-
 static int executable_mappings_of(unsigned long base, unsigned long* lo,
                                   unsigned long* hi, int max)
 {
@@ -913,171 +1351,6 @@ static unsigned char* find_signature(unsigned char* lo, unsigned char* hi,
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* installing the hook                                                */
-/* ------------------------------------------------------------------ */
-
-/*
- * The first bytes of the function are replaced by a jump to a stub of
- * ours, and the bytes that were there are replayed by a trampoline, so the
- * function runs as if nothing happened:
- *
- *     the function:  49 BB <stub>   41 FF E3        mov r11, stub; jmp r11
- *     the stub:      saves the registers, calls the handler, restores them,
- *                    and jumps into the trampoline
- *     the trampoline: the bytes of the prologue, then the rest of the
- *                    function
- *
- * The bytes that are replaced are exactly one prologue of this client,
- * thirteen bytes: push rbp; mov rbp, rsp; push r15; push r14; push rbx;
- * push rax; mov r14d, edx.  They end on an instruction boundary, which is
- * why the trampoline can replay them; the length is checked against the
- * bytes of the client before the patch is written.
- */
-#define PROLOGUE_LEN 13
-
-static void* alloc_exec(size_t len)
-{
-    void* p = mmap(0, len, PROT_READ | PROT_WRITE | PROT_EXEC,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return p == MAP_FAILED ? 0 : p;
-}
-
-static int install_hook(unsigned char* target, const unsigned char* prologue, int plen)
-{
-    /*
-     * The prologue that is about to be overwritten has to be the one the
-     * trampoline replays.  A client built from other sources would have
-     * other bytes here, and patching it would break the function.
-     */
-    if (memcmp(target, prologue, PROLOGUE_LEN) != 0)
-    {
-        wieen_log("wieen: the function does not start the way it did, not touching it\n");
-        return -1;
-    }
-    (void)plen;
-
-    long page = ((long)target) & ~0xFFFUL;
-    if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
-    {
-        wieen_log("wieen: mprotect failed: %s\n", strerror(errno));
-        return -1;
-    }
-    if (env_flag("WIEEN_MPROTECT_ONLY"))
-    {
-        wieen_log("wieen: mprotect only, no patch\n");
-        mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
-        return 0;
-    }
-
-    unsigned char* tramp = alloc_exec(4096);
-    if (!tramp)
-        return -1;
-    memcpy(tramp, target, PROLOGUE_LEN);
-    unsigned char* p = tramp + PROLOGUE_LEN;
-    *p++ = 0x48; /* mov rax, target + PROLOGUE_LEN */
-    *p++ = 0xB8;
-    unsigned long cont = (unsigned long)(target + PROLOGUE_LEN);
-    for (int i = 0; i < 8; i++)
-        *p++ = (unsigned char)(cont >> (i * 8));
-    *p++ = 0xFF; /* jmp rax */
-    *p++ = 0xE0;
-    g_trampoline = tramp;
-
-    unsigned char* stub = alloc_exec(4096);
-    if (!stub)
-        return -1;
-    unsigned char* s = stub;
-    /* sub rsp, 0x80 - the immediate has to be 32 bit, 0x80 would sign extend */
-    *s++ = 0x48; *s++ = 0x81; *s++ = 0xEC;
-    *s++ = 0x80; *s++ = 0x00; *s++ = 0x00; *s++ = 0x00;
-    *s++ = 0x50;                                          /* push rax */
-    *s++ = 0x57;                                          /* push rdi */
-    *s++ = 0x56;                                          /* push rsi */
-    *s++ = 0x52;                                          /* push rdx */
-    *s++ = 0x51;                                          /* push rcx */
-    *s++ = 0x41; *s++ = 0x50;                             /* push r8 */
-    *s++ = 0x41; *s++ = 0x51;                             /* push r9 */
-    *s++ = 0x53;                                          /* push rbx */
-    *s++ = 0x55;                                          /* push rbp */
-    *s++ = 0x41; *s++ = 0x54;                             /* push r12 */
-    *s++ = 0x41; *s++ = 0x55;                             /* push r13 */
-    *s++ = 0x41; *s++ = 0x56;                             /* push r14 */
-    *s++ = 0x41; *s++ = 0x57;                             /* push r15 */
-    /*
-     * The registers were pushed in this order: rax, rdi, rsi, rdx, rcx,
-     * r8, r9, rbx, rbp, r12, r13, r14, r15.  The state is in the saved
-     * rdi, which is 11 slots below the top of the stack: r15 at +0, r14
-     * at +8, r13 at +16, r12 at +24, rbp at +32, rbx at +40, r9 at +48,
-     * r8 at +56, rcx at +64, rdx at +72, rsi at +80, rdi at +88.  Reload
-     * all three arguments after the handler: its C call clobbers rsi/rdx.
-     */
-    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x7C; *s++ = 0x24; *s++ = 0x58; /* mov rdi,[rsp+0x58] */
-    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x74; *s++ = 0x24; *s++ = 0x50; /* mov rsi,[rsp+0x50] */
-    *s++ = 0x48; *s++ = 0x8B; *s++ = 0x54; *s++ = 0x24; *s++ = 0x48; /* mov rdx,[rsp+0x48] */
-    *s++ = 0x48; *s++ = 0xB8;                             /* mov rax, handler */
-    {
-        unsigned long v = (unsigned long)(void*)g_handler;
-        for (int i = 0; i < 8; i++)
-            s[i] = (unsigned char)(v >> (i * 8));
-        s += 8;
-    }
-    *s++ = 0xFF; *s++ = 0xD0;                             /* call rax */
-    *s++ = 0x41; *s++ = 0x5F;                             /* pop r15 */
-    *s++ = 0x41; *s++ = 0x5E;                             /* pop r14 */
-    *s++ = 0x41; *s++ = 0x5D;                             /* pop r13 */
-    *s++ = 0x41; *s++ = 0x5C;                             /* pop r12 */
-    *s++ = 0x5D;                                          /* pop rbp */
-    *s++ = 0x5B;                                          /* pop rbx */
-    *s++ = 0x41; *s++ = 0x59;                             /* pop r9 */
-    *s++ = 0x41; *s++ = 0x58;                             /* pop r8 */
-    *s++ = 0x59;                                          /* pop rcx */
-    *s++ = 0x5A;                                          /* pop rdx */
-    *s++ = 0x5E;                                          /* pop rsi */
-    *s++ = 0x5F;                                          /* pop rdi */
-    *s++ = 0x58;                                          /* pop rax */
-    /* add rsp, 0x80 */
-    *s++ = 0x48; *s++ = 0x81; *s++ = 0xC4;
-    *s++ = 0x80; *s++ = 0x00; *s++ = 0x00; *s++ = 0x00;
-    *s++ = 0x48; *s++ = 0xB8;                             /* mov rax, trampoline */
-    {
-        unsigned long v = (unsigned long)tramp;
-        for (int i = 0; i < 8; i++)
-            s[i] = (unsigned char)(v >> (i * 8));
-        s += 8;
-    }
-    *s++ = 0xFF; *s++ = 0xE0;                             /* jmp rax */
-
-    /* the patch: mov r11, stub; jmp r11 */
-    if (env_flag("WIEEN_NOPATCH"))
-    {
-        wieen_log("wieen: stub built, not patching %p (WIEEN_NOPATCH)\n", target);
-        mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
-        mprotect(stub, 4096, PROT_READ | PROT_EXEC);
-        mprotect(tramp, 4096, PROT_READ | PROT_EXEC);
-        return 0;
-    }
-    target[0] = 0x49;
-    target[1] = 0xBB;
-    unsigned long stubaddr = (unsigned long)stub;
-    for (int i = 0; i < 8; i++)
-        target[2 + i] = (unsigned char)(stubaddr >> (i * 8));
-    target[10] = 0x41;
-    target[11] = 0xFF;
-    target[12] = 0xE3;
-
-    /*
-     * Sober checks the memory map of the client and does not like pages
-     * that are writable and executable, so the page goes back to what it
-     * was - the same for our own stub pages.
-     */
-    mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
-    mprotect(stub, 4096, PROT_READ | PROT_EXEC);
-    mprotect(tramp, 4096, PROT_READ | PROT_EXEC);
-    (void)prologue;
-    (void)plen;
-    return 0;
-}
 
 /* ------------------------------------------------------------------ */
 /* the socket server                                                  */
@@ -1146,6 +1419,32 @@ static void serve(int fd)
             continue;
         }
 
+        /*
+         * The state of the game is looked up before the script is read: the
+         * probe of the selector uses the same buffer, and the answer of the
+         * game has to be known before the script can be handed over.
+         */
+        wieen_log("wieen: command of %u bytes received\n", len);
+        if (!ensure_preresume())
+        {
+            static char sink[4096];
+            uint32_t left = len;
+            while (left)
+            {
+                size_t want = left < sizeof(sink) ? left : sizeof(sink);
+                if (read_exact(fd, sink, want) != 0)
+                    return;
+                left -= (uint32_t)want;
+            }
+            const char message[] = "the Luau state was not found";
+            uint32_t outlen = (uint32_t)(sizeof(message) - 1);
+            if (write_exact(fd, &outlen, sizeof(outlen)) != 0)
+                return;
+            if (write_exact(fd, message, outlen) != 0)
+                return;
+            continue;
+        }
+
         pthread_mutex_lock(&g_lock);
         g_pending_len = 0;
         g_pending_ready = 0;
@@ -1156,7 +1455,6 @@ static void serve(int fd)
         if (len && read_exact(fd, g_pending, len) != 0)
             return;
 
-        wieen_log("wieen: command of %u bytes received\n", len);
         pthread_mutex_lock(&g_lock);
         g_pending_len = len;
         g_pending_ready = 1;
@@ -1369,20 +1667,19 @@ static void* setup_thread(void* arg)
         return 0;
     }
 
-    if (env_flag("WIEEN_NOHOOK"))
-    {
-        wieen_log("wieen: hook disabled by WIEEN_NOHOOK\n");
-    }
-    else if (install_hook((unsigned char*)g_resume_addr, SIG_RESUME,
-                          (int)sizeof(SIG_RESUME)) != 0)
-        return 0;
-    else
-    {
-        wieen_log("wieen: hooked lua_resume at %p\n", g_resume_addr);
-    }
+    /*
+     * The code of the client is left alone.  It checks the bytes of its
+     * own text about a minute after the start and leaves when they do not
+     * match, so a patch of lua_resume is not an option any more: the
+     * hook is the pre-resume callback in the state of Luau, and that
+     * pointer lives in writable memory the check does not look at.
+     */
+    wieen_log("wieen: the code of the client is left alone\n");
 
     pthread_t thread;
     if (pthread_create(&thread, 0, server_thread, 0) == 0)
+        pthread_detach(thread);
+    if (pthread_create(&thread, 0, selector_thread, 0) == 0)
         pthread_detach(thread);
     return 0;
 }
@@ -1397,6 +1694,7 @@ __attribute__((constructor)) static void wieen_init(void)
     if (env_flag("WIEEN_OFF"))
         return;
     wieen_log("\n=== wieen agent (pid %d) ===\n", (int)getpid());
+    wieen_log("wieen: the hook is the pre-resume callback of the state of Luau\n");
     pthread_t thread;
     if (pthread_create(&thread, 0, setup_thread, 0) == 0)
         pthread_detach(thread);

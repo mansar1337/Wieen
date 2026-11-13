@@ -16,6 +16,12 @@ BUILD_DIR := build
 AGENT     := $(BUILD_DIR)/wieen_agent.so
 COMPILER  := $(BUILD_DIR)/wieen-compile
 
+# the probe of the agent is compiled here: the client has the VM, but not
+# the compiler, so the bytes are put into the agent before it is built
+PROBE_SRC := tools/probe.luau
+PROBE_BIN := $(BUILD_DIR)/probe.bin
+PROBE_HDR := $(BUILD_DIR)/probe_bytecode.h
+
 LUAU_DIR  := work/luau-src
 LUAU_LIB  := $(LUAU_DIR)/build-rel
 
@@ -28,10 +34,15 @@ all: agent compile
 
 agent: $(AGENT)
 
-$(AGENT): $(AGENT_DIR)/wieen_agent.c
+$(AGENT): $(AGENT_DIR)/wieen_agent.c $(PROBE_HDR)
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(LDFLAGS) -I $(BUILD_DIR) -o $@ $<
 	@echo "built $@"
+
+$(PROBE_HDR): $(PROBE_SRC) $(COMPILER) tools/bin2h.py
+	@mkdir -p $(BUILD_DIR)
+	$(COMPILER) $(PROBE_SRC) > $(PROBE_BIN)
+	python3 tools/bin2h.py $(PROBE_BIN) wieen_probe > $@
 
 compile: $(COMPILER)
 
