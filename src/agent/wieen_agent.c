@@ -102,6 +102,9 @@ static const struct signature SIGNATURES[] = {
 };
 #define WIEEN_NSIG (int)(sizeof(SIGNATURES) / sizeof(SIGNATURES[0]))
 
+/* the first 16 MiB of the client the tables were made for */
+#define WIEEN_KNOWN_HASH 0x18d8af04a276288dULL
+
 static fn_load g_load;
 static fn_resume g_resume;
 static fn_newthread g_newthread;
@@ -368,7 +371,6 @@ static void run_pending(void* parent)
     memcpy(chunk, g_pending, bclen);
 
     /* The thread object on the parent stack roots our coroutine against GC. */
-    char* saved_top = *(char**)((char*)parent + LSTATE_TOP);
     const char* message = 0;
     size_t messagelen = 0;
     int status = -1;
@@ -376,6 +378,7 @@ static void run_pending(void* parent)
     wieen_log("wieen: creating thread for %lu bytes in parent %p\n",
               (unsigned long)bclen, parent);
     void* thread = g_newthread(parent);
+    int pushed = thread != 0;
 
     wieen_log("wieen: created thread %p\n", thread);
 
@@ -505,7 +508,20 @@ static void run_pending(void* parent)
     pthread_cond_signal(&g_done);
     pthread_mutex_unlock(&g_lock);
 
-    *(char**)((char*)parent + LSTATE_TOP) = saved_top;
+    /*
+     * Drop the thread from the parent's stack.  The pointer saved before
+     * lua_newthread cannot be used here: the call may grow the stack of
+     * the parent, which reallocates it, and writing the old pointer back
+     * would leave L->top pointing into memory that no longer belongs to
+     * the state - the client then dies some frames later, far from here.
+     * The slot is taken from the top as it is now instead.
+     */
+    if (pushed)
+    {
+        char** top = (char**)((char*)parent + LSTATE_TOP);
+        if (*top && *top - 16 >= *(char**)((char*)parent + LSTATE_STACK))
+            *top -= 16;
+    }
 }
 
 /*
@@ -757,13 +773,72 @@ static unsigned long long hash_image(unsigned long base, unsigned long size)
     return h;
 }
 
+/*
+ * How far from the base a mapping may start and still belong to the
+ * client image.  The image is around a hundred megabytes, so a quarter of
+ * a gigabyte is safely outside of any other library.
+ */
+#define IMAGE_SPAN 0x10000000UL
+#define MAX_TEXT_RANGES 8
+
+/*
+ * The client is not mapped as one readable blob: the loader keeps the ELF
+ * header on a read-only page and starts the text a page or two later, and
+ * the client itself calls mprotect on the parts it patches at runtime.
+ * Looking for one "executable range that contains the base" therefore
+ * works only by luck, and it stopped working when the client moved from
+ * 4 KiB to 16 KiB pages.  So the agent keeps every executable mapping of
+ * the image and looks the signatures up in all of them.
+ */
+static unsigned long g_text_lo[MAX_TEXT_RANGES];
+static unsigned long g_text_hi[MAX_TEXT_RANGES];
+static int g_text_count;
+
+static int executable_mappings_of(unsigned long base, unsigned long* lo,
+                                  unsigned long* hi, int max)
+{
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return 0;
+    char line[1024];
+    int count = 0;
+    while (fgets(line, sizeof(line), f))
+    {
+        unsigned long l, h, off;
+        char perms[8], path[256];
+        path[0] = 0;
+        if (sscanf(line, "%lx-%lx %7s %lx %255s", &l, &h, perms, &off, path) < 4)
+            continue;
+        if (perms[2] != 'x')
+            continue;
+        if (l < base || l - base >= IMAGE_SPAN)
+            continue;
+        if (count == max)
+            break;
+        lo[count] = l;
+        hi[count] = h;
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
+/*
+ * The client image among everything the process has mapped: the biggest
+ * executable mapping that starts with an ELF header, and - when there is
+ * more than one candidate - the one that carries the code we are after.
+ * The second test is what keeps the agent from latching onto an unrelated
+ * large library after the client moves.
+ */
 static unsigned long find_client_base(void)
 {
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f)
         return 0;
     char line[1024];
-    unsigned long best = 0, bestsize = 0;
+    unsigned long candidate[8];
+    unsigned long size[8];
+    int count = 0;
     while (fgets(line, sizeof(line), f))
     {
         unsigned long lo, hi, off;
@@ -775,50 +850,58 @@ static unsigned long find_client_base(void)
             continue;
         if (hi - lo < 0x4000000)
             continue; /* the client image is a hundred megabytes */
-        if (hi - lo <= bestsize)
+        unsigned long base = lo - off;
+        if (memcmp((void*)base, "\177ELF", 4) != 0)
             continue;
-        bestsize = hi - lo;
-        best = lo - off;
+        if (count == (int)(sizeof(candidate) / sizeof(candidate[0])))
+            continue;
+        candidate[count] = base;
+        size[count] = hi - lo;
+        count++;
     }
     fclose(f);
-    if (!best)
+    if (!count)
         return 0;
-    if (memcmp((void*)best, "\177ELF", 4) != 0)
-        return 0;
-    return best;
+
+    /* a candidate that has lua_resume where we last saw it wins */
+    for (int i = 0; i < count; i++)
+    {
+        unsigned long at = candidate[i] + SIGNATURES[0].offset;
+        if (at + sizeof(SIG_RESUME) > candidate[i] + size[i])
+            continue; /* the offset falls outside of this image */
+        if (memcmp((void*)at, SIG_RESUME, sizeof(SIG_RESUME)) == 0)
+            return candidate[i];
+    }
+
+    /* otherwise the biggest one, which is what the client always is */
+    int pick = 0;
+    for (int i = 1; i < count; i++)
+        if (size[i] > size[pick])
+            pick = i;
+    if (count > 1)
+        wieen_log("wieen: %d candidate images, picked the largest at %p\n", count,
+                  (void*)candidate[pick]);
+    return candidate[pick];
 }
 
-/* the executable range of the client image */
-static int find_text_range(unsigned long* lo, unsigned long* hi)
+/* the executable ranges of the client image */
+static int find_text_ranges(void)
 {
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (!f)
+    g_text_count = executable_mappings_of(g_base, g_text_lo, g_text_hi,
+                                          MAX_TEXT_RANGES);
+    if (!g_text_count)
         return 0;
-    char line[1024];
-    int found = 0;
-    while (fgets(line, sizeof(line), f))
-    {
-        unsigned long l, h, off;
-        char perms[8], path[256];
-        path[0] = 0;
-        if (sscanf(line, "%lx-%lx %7s %lx %255s", &l, &h, perms, &off, path) < 4)
-            continue;
-        if (perms[2] != 'x')
-            continue;
-        if (!(l <= g_base && g_base < h))
-            continue;
-        *lo = l;
-        *hi = h;
-        found = 1;
-        break;
-    }
-    fclose(f);
-    return found;
+    for (int i = 0; i < g_text_count; i++)
+        wieen_log("wieen: text %#lx-%#lx (%lu KiB)\n", g_text_lo[i], g_text_hi[i],
+                  (g_text_hi[i] - g_text_lo[i]) / 1024);
+    return 1;
 }
 
 static unsigned char* find_signature(unsigned char* lo, unsigned char* hi,
                                      const unsigned char* pattern, int len)
 {
+    if (!lo || !hi || hi - lo < len)
+        return 0;
     unsigned char* p = lo;
     unsigned char* last = hi - len;
     while (p <= last)
@@ -1157,7 +1240,10 @@ static void* setup_thread(void* arg)
         usleep(100000);
     }
     if (!g_base)
+    {
+        wieen_log("wieen: no client image in this process, nothing to do\n");
         return 0;
+    }
 
     /*
      * The handlers of the game are only watched when somebody asks for
@@ -1168,44 +1254,69 @@ static void* setup_thread(void* arg)
         install_crash_handler();
     refresh_maps();
 
+    unsigned long long hash = hash_image(g_base, 16 * 1024 * 1024);
     wieen_log("wieen: image of the client at %p, hash %016llx\n", (void*)g_base,
-              hash_image(g_base, 16 * 1024 * 1024));
+              hash);
+    if (hash != WIEEN_KNOWN_HASH)
+        wieen_log("wieen: this is not the build the tables were made for "
+                  "(known %016llx), falling back to the signatures\n",
+                  (unsigned long long)WIEEN_KNOWN_HASH);
 
-    unsigned long lo = 0, hi = 0;
-    if (!find_text_range(&lo, &hi))
+    if (!find_text_ranges())
+    {
+        wieen_log("wieen: no executable mapping in the image of the client\n");
         return 0;
+    }
 
-    unsigned char* text = (unsigned char*)lo;
-    unsigned char* end = (unsigned char*)hi;
+    /*
+     * WIEEN_SCAN logs every place a signature is found, not only the one
+     * the agent settles on.  It is how the offsets in
+     * tools/opcode_map.* are re-derived after the client moves.
+     */
+    int scan = env_flag("WIEEN_SCAN");
 
     for (int i = 0; i < WIEEN_NSIG; i++)
     {
         const struct signature* sig = &SIGNATURES[i];
         unsigned char* at = 0;
+        unsigned char* expected = (unsigned char*)(g_base + sig->offset);
+        long bestdistance = -1;
 
         /* the place the function was found when the client was analysed */
-        unsigned char* expected = (unsigned char*)(g_base + sig->offset);
-        if (expected >= text && expected + sig->length <= end &&
-            memcmp(expected, sig->bytes, sig->length) == 0)
+        for (int r = 0; r < g_text_count; r++)
         {
-            at = expected;
+            unsigned char* lo = (unsigned char*)g_text_lo[r];
+            unsigned char* hi = (unsigned char*)g_text_hi[r];
+            if (expected >= lo && expected + sig->length <= hi &&
+                memcmp(expected, sig->bytes, sig->length) == 0)
+                at = expected;
         }
-        else
+
+        /* the client moved: take the signature closest to where the
+           function used to be */
+        if (!at)
         {
-            /* the client moved: take the signature closest to where the
-               function used to be */
             unsigned char* best = 0;
-            long bestdistance = 0;
-            for (unsigned char* p = find_signature(text, end, sig->bytes, sig->length);
-                 p; p = find_signature(p + 1, end, sig->bytes, sig->length))
+            for (int r = 0; r < g_text_count; r++)
             {
-                long distance = (long)(p - expected);
-                if (distance < 0)
-                    distance = -distance;
-                if (!best || distance < bestdistance)
+                unsigned char* lo = (unsigned char*)g_text_lo[r];
+                unsigned char* hi = (unsigned char*)g_text_hi[r];
+                for (unsigned char* p = find_signature(lo, hi, sig->bytes, sig->length);
+                     p; p = find_signature(p + 1, hi, sig->bytes, sig->length))
                 {
-                    best = p;
-                    bestdistance = distance;
+                    long distance = (long)(p - expected);
+                    if (distance < 0)
+                        distance = -distance;
+                    if (scan)
+                        wieen_log("wieen: %s candidate at %#lx (distance %ld)\n",
+                                  sig->name,
+                                  (unsigned long)(p - (unsigned char*)g_base),
+                                  distance);
+                    if (!best || distance < bestdistance)
+                    {
+                        best = p;
+                        bestdistance = distance;
+                    }
                 }
             }
             if (best && bestdistance < 0x200000)
@@ -1233,7 +1344,13 @@ static void* setup_thread(void* arg)
     }
 
     if (!g_resume_addr || !g_load || !g_tolstring || !g_newthread)
+    {
+        wieen_log("wieen: not installing, missing lua_resume=%d luau_load=%d "
+                  "lua_tolstring=%d lua_newthread=%d\n",
+                  g_resume_addr != 0, g_load != 0, g_tolstring != 0,
+                  g_newthread != 0);
         return 0;
+    }
 
     if (env_flag("WIEEN_NOHOOK"))
     {

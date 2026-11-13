@@ -16,14 +16,21 @@ if [ -z "$USER_HOME" ] && [ -n "${SUDO_USER:-}" ]; then
 fi
 USER_HOME="${USER_HOME:-$HOME}"
 DATA="$USER_HOME/.var/app/org.vinegarhq.Sober/data/wieen"
-# pick the runtime version Sober actually uses
-VER=$(flatpak info org.vinegarhq.Sober 2>/dev/null | sed -n 's/.*Runtime:.*\/\([0-9][0-9]*\)$/\1/p' | tail -1)
+# pick the runtime Sober actually uses.  Asking flatpak for the runtime of
+# the app is locale independent, unlike scraping `flatpak info`.
+REF="$(flatpak list --app --columns=application,runtime 2>/dev/null \
+       | awk -F'\t' '$1 == "org.vinegarhq.Sober" {print $2; exit}')"
 RUNTIME=""
-for cand in /var/lib/flatpak/runtime/org.gnome.Platform/x86_64/$VER/active; do
-    [ -e "$cand" ] || continue
-    RUNTIME="$(readlink -f "$cand")/files"
+for cand in "/var/lib/flatpak/runtime/$REF/active/files" \
+            "$USER_HOME/.local/share/flatpak/runtime/$REF/active/files"; do
+    [ -n "$REF" ] || continue
+    [ -d "$cand" ] || continue
+    RUNTIME="$(readlink -f "$cand")"
 done
-[ -n "$RUNTIME" ] || RUNTIME="$(readlink -f /var/lib/flatpak/runtime/org.gnome.Platform/x86_64/51/active)/files"
+if [ -z "$RUNTIME" ]; then
+    echo "cannot find the flatpak runtime Sober uses (ref '$REF')" >&2
+    exit 1
+fi
 
 mkdir -p "$DATA"
 cp "$REPO/build/wieen_agent.so" "$DATA/wieen_agent.so"
@@ -34,5 +41,13 @@ if [ ! -w "$RUNTIME/etc" ]; then
     exit 1
 fi
 echo "$DATA/wieen_agent.so" > "$RUNTIME/etc/ld.so.preload"
+if [ "$(cat "$RUNTIME/etc/ld.so.preload")" != "$DATA/wieen_agent.so" ]; then
+    echo "the preload did not take in $RUNTIME/etc/ld.so.preload" >&2
+    exit 1
+fi
 echo "preload registered: $RUNTIME/etc/ld.so.preload"
+echo
+echo "note: a flatpak runtime update replaces that deploy directory and the"
+echo "preload goes with it.  if the agent stops loading after 'flatpak update',"
+echo "run 'wieen launch' - it checks and registers the preload again."
 echo "start Sober and join a game, then: wieen status"

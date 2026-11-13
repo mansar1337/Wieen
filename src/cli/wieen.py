@@ -53,6 +53,68 @@ def agent_path() -> Path:
     return wieen_dir() / "wieen_agent.so"
 
 
+# ---------------------------------------------------------------- preload
+
+
+def runtime_ref() -> str | None:
+    """The runtime Sober runs on, as flatpak composes it: app/arch/branch."""
+    try:
+        out = subprocess.run(
+            ["flatpak", "list", "--app", "--columns=application,runtime"],
+            capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0].strip() == APP_ID:
+            return parts[1].strip()
+    return None
+
+
+def preload_file() -> Path | None:
+    """The ld.so.preload of the runtime deploy Sober is using right now.
+
+    A runtime update replaces the deploy directory wholesale, and the
+    preload goes with it - which is why the agent silently stops loading
+    after `flatpak update`.
+    """
+    ref = runtime_ref()
+    if not ref:
+        return None
+    roots = [Path("/var/lib/flatpak/runtime"),
+             Path.home() / ".local/share/flatpak/runtime"]
+    for root in roots:
+        active = root / ref / "active"
+        if active.exists():
+            return active.resolve() / "files" / "etc" / "ld.so.preload"
+    return None
+
+
+def preload_ok() -> bool | None:
+    """True when the agent is registered, False when it is not, None when
+    the runtime cannot be inspected (no flatpak, no read access)."""
+    path = preload_file()
+    if path is None:
+        return None
+    try:
+        return path.read_text().strip() == str(agent_path())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+
+
+def preload_hint() -> str:
+    path = preload_file()
+    where = str(path) if path else "the flatpak runtime"
+    return (f"the preload is not registered in the current runtime deploy:\n"
+            f"  {where}\n"
+            f"flatpak updates the runtime by replacing that directory, and the\n"
+            f"preload is lost with it. register it again:\n"
+            f"  sudo {REPO / 'tools' / 'install_preload.sh'}\n"
+            f"or just run: wieen launch (it fixes it before starting Sober)")
+
+
 # ---------------------------------------------------------------- protocol
 
 
@@ -147,6 +209,12 @@ def cmd_launch(args: argparse.Namespace) -> int:
     if not agent_path().exists():
         print("agent not installed, run: wieen install", file=sys.stderr)
         return 1
+    if preload_ok() is False:
+        print("the flatpak runtime forgot the preload (it was updated),"
+              " registering it again", file=sys.stderr)
+        if subprocess.call(["sudo", "bash", str(REPO / "tools" / "install_preload.sh")]) != 0:
+            print("could not register the preload", file=sys.stderr)
+            return 1
     cmd = ["flatpak", "run", APP_ID]
     if args.url:
         cmd.append(args.url)
@@ -158,6 +226,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     a = Agent()
     if not a.connect():
         print(f"no agent listening on {a.path}")
+        if preload_ok() is False:
+            print(preload_hint())
+            return 1
         print("hint: wieen install && wieen launch")
         return 1
     try:
@@ -176,6 +247,8 @@ def cmd_exec(args: argparse.Namespace) -> int:
     a = Agent()
     if not a.connect():
         print(f"no agent listening on {a.path}", file=sys.stderr)
+        if preload_ok() is False:
+            print(preload_hint(), file=sys.stderr)
         return 1
     try:
         print(a.exec(args.source))
