@@ -1049,6 +1049,14 @@ static int install_hook(unsigned char* target, const unsigned char* prologue, in
     *s++ = 0xFF; *s++ = 0xE0;                             /* jmp rax */
 
     /* the patch: mov r11, stub; jmp r11 */
+    if (env_flag("WIEEN_NOPATCH"))
+    {
+        wieen_log("wieen: stub built, not patching %p (WIEEN_NOPATCH)\n", target);
+        mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
+        mprotect(stub, 4096, PROT_READ | PROT_EXEC);
+        mprotect(tramp, 4096, PROT_READ | PROT_EXEC);
+        return 0;
+    }
     target[0] = 0x49;
     target[1] = 0xBB;
     unsigned long stubaddr = (unsigned long)stub;
@@ -1095,7 +1103,12 @@ static int write_exact(int fd, const void* buf, size_t len)
     {
         ssize_t n = write(fd, (const char*)buf + put, len - put);
         if (n <= 0)
+        {
+            if (env_flag("WIEEN_SOCKET_LOG"))
+                wieen_log("wieen: write on %d failed after %lu bytes: %s\n", fd,
+                          (unsigned long)put, strerror(errno));
             return -1;
+        }
         put += (size_t)n;
     }
     return 0;
@@ -1201,6 +1214,8 @@ static void* server_thread(void* arg)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return 0;
+    if (env_flag("WIEEN_SOCKET_LOG"))
+        wieen_log("wieen: unix socket fd %d\n", fd);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
         listen(fd, 4) != 0)
     {
@@ -1220,6 +1235,8 @@ static void* server_thread(void* arg)
             break;
         }
         serve(c);
+        if (env_flag("WIEEN_SOCKET_LOG"))
+            wieen_log("wieen: connection on fd %d closed\n", c);
         close(c);
     }
     return 0;

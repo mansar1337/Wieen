@@ -209,13 +209,20 @@ def cmd_launch(args: argparse.Namespace) -> int:
     if not agent_path().exists():
         print("agent not installed, run: wieen install", file=sys.stderr)
         return 1
-    if preload_ok() is False:
+    if preload_ok() is False and not getattr(args, "no_preload_fix", False):
         print("the flatpak runtime forgot the preload (it was updated),"
               " registering it again", file=sys.stderr)
         if subprocess.call(["sudo", "bash", str(REPO / "tools" / "install_preload.sh")]) != 0:
             print("could not register the preload", file=sys.stderr)
             return 1
-    cmd = ["flatpak", "run", APP_ID]
+    cmd = ["flatpak", "run"]
+    # Flags for the agent inside the sandbox go through the host
+    # environment, so there is no second set of switches to remember:
+    #   WIEEN_FAULTLOG=1 wieen launch
+    for name, value in os.environ.items():
+        if name.startswith("WIEEN_") and name not in ("WIEEN_SOCKET",):
+            cmd.append(f"--env={name}={value}")
+    cmd += [APP_ID]
     if args.url:
         cmd.append(args.url)
     print("launching:", " ".join(cmd))
@@ -308,6 +315,8 @@ def main() -> int:
 
     sp = sub.add_parser("launch", help="start Sober with the agent preloaded")
     sp.add_argument("url", nargs="?", help="experience to open")
+    sp.add_argument("--no-preload-fix", action="store_true",
+                    help="start Sober without touching the runtime preload")
     sp.set_defaults(func=cmd_launch)
 
     sp = sub.add_parser("status", help="check whether the agent is reachable")
