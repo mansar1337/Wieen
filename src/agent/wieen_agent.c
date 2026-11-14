@@ -165,6 +165,9 @@ static unsigned long g_base;
 #define LSTATE_ACTIVE 0x06
 /* the set of capabilities of Roblox for the thread */
 #define LSTATE_CAPS 0x0c
+/* the sandbox context of a thread: its capability mask is a u64 at +0x80 */
+#define LSTATE_CTX 0x20
+#define WIEEN_CTX_CAPS 0x80
 
 /* ------------------------------------------------------------------ */
 /* logging                                                            */
@@ -225,6 +228,7 @@ static int env_flag(const char* name)
 
 static void run_pending(void* parent);
 static void run_probe(void* L);
+static void wieen_log_frames(void* L, void* fnval);
 static int wieen_pcall(void* L, int nargs, int nresults, int errfunc);
 
 /*
@@ -246,6 +250,9 @@ static unsigned int g_rich_caps;
 
 /* set while the fallback runs a script outside the thread of the game */
 static int g_inthread_off;
+
+/* the capability mask a script can be given through its environment table */
+static unsigned long long g_env_mask;
 
 /* the mask a thread of the game must have for the script to run in it */
 static unsigned int g_want_caps;
@@ -589,6 +596,8 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
         char* top = *(char**)((char*)rt + LSTATE_TOP);
         wieen_log("wieen: loaded %lu bytes, the function is at %p\n",
                   (unsigned long)bclen, top - 16);
+        if (env_flag("WIEEN_FRAMELOG"))
+            wieen_log_frames(rt, top - 16);
         if (status == 0 && env_flag("WIEEN_NORESUME"))
         {
             wieen_log("wieen: resume disabled by WIEEN_NORESUME\n");
@@ -651,8 +660,162 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                 }
             }
 
+            /*
+             * The sandbox does not read the mask at +0x0c.  Its check
+             * (0x22ea744, "The current thread cannot access 'X' (lacking
+             * capability Y)") reads a u64 at [[context]+0x190], and the
+             * accessor at 0x22ea488 builds the mask of a thread out of
+             * [[L+0x20]+0x80] intersected with a global limit.  The context
+             * and the offset are data as well, so they can be lent for the
+             * call and given back afterwards.
+             */
+            void** pctx = (void**)((char*)parent + LSTATE_CTX);
+            void* ctx = (*pctx && is_mapped(*pctx)) ? *pctx : 0;
+            unsigned long long savedcaps64 = 0;
+            int lent64 = 0;
+            unsigned long capsoff = WIEEN_CTX_CAPS;
+            const char* atenv = getenv("WIEEN_SANDBOXAT");
+            if (atenv && *atenv)
+                capsoff = strtoul(atenv, 0, 0);
+            unsigned long long* caps64 = 0;
+            if (ctx && is_mapped((char*)ctx + capsoff))
+                caps64 = (unsigned long long*)((char*)ctx + capsoff);
+            if (env_flag("WIEEN_SANDBOXLOG"))
+                wieen_log("wieen: the sandbox: L=%p ctx=%p caps@%#lx = "
+                          "%#llx\n", parent, ctx, capsoff,
+                          caps64 ? *caps64 : 0ULL);
+            const char* tcaps = getenv("WIEEN_THREADCAPS");
+            if (!tcaps || !*tcaps)
+            {
+                const char* tfile = getenv("WIEEN_THREADCAPSFILE");
+                static char tbuf[64];
+                if (tfile && *tfile)
+                {
+                    FILE* tf = fopen(tfile, "r");
+                    if (tf)
+                    {
+                        if (fgets(tbuf, sizeof(tbuf), tf))
+                            tcaps = tbuf;
+                        fclose(tf);
+                    }
+                }
+            }
+            if (caps64 && tcaps && *tcaps)
+            {
+                savedcaps64 = *caps64;
+                *caps64 = strtoull(tcaps, 0, 0);
+                lent64 = 1;
+                wieen_log("wieen: the caps of the sandbox are lent as %#llx "
+                          "(was %#llx)\n", *caps64, savedcaps64);
+            }
+
+            if (env_flag("WIEEN_DUMPSTATE"))
+            {
+                for (int q = 0; q < 0x60; q += 8)
+                    wieen_log("wieen: L+%02x = %p\n", q,
+                              *(void**)((char*)parent + q));
+                for (int q = 0x18; q <= 0x28; q += 8)
+                {
+                    void* p = *(void**)((char*)parent + q);
+                    if (p && is_mapped(p))
+                        wieen_log("wieen: [L+%02x]+0x190 = %#llx, +0x80 = "
+                                  "%#llx\n", q,
+                                  is_mapped((char*)p + 0x190)
+                                      ? *(unsigned long long*)((char*)p + 0x190)
+                                      : 0ULL,
+                                  is_mapped((char*)p + 0x80)
+                                      ? *(unsigned long long*)((char*)p + 0x80)
+                                      : 0ULL);
+                }
+                void* c0 = *(void**)((char*)parent + LSTATE_CTX);
+                if (c0 && is_mapped(c0))
+                    for (int q = 0; q < 0x200; q += 8)
+                        wieen_log("wieen: ctx+%03x = %#llx\n", q,
+                                  is_mapped((char*)c0 + q)
+                                      ? *(unsigned long long*)((char*)c0 + q)
+                                      : 0ULL);
+            }
+            if (env_flag("WIEEN_CHECKERLOG"))
+            {
+                typedef void* (*fn_single)(void*, int);
+                fn_single single = (fn_single)(g_base + 0x2992ee0UL);
+                void* chk = single((void*)(g_base + 0x6f85d50UL), 0);
+                wieen_log("wieen: checker %p\n", chk);
+                if (chk && is_mapped(chk))
+                    for (int q = 0; q < 0x80; q += 8)
+                        wieen_log("wieen: chk+%02x = %#llx\n", q,
+                                  *(unsigned long long*)((char*)chk + q));
+            }
+            void* fval = top - 16;
+            void* closure = (fval && is_mapped(fval)) ? *(void**)fval : 0;
+            void* env = (closure && is_mapped(closure))
+                            ? *(void**)((char*)closure + 0x18)
+                            : 0;
+            void** penv = (env && is_mapped((char*)env + 0x70))
+                              ? (void**)((char*)env + 0x70)
+                              : 0;
+            void* savedenv = penv ? *penv : 0;
+            int lenved = 0;
+            if (env_flag("WIEEN_ENVLOG"))
+                wieen_log("wieen: the env of the chunk: closure %p env %p "
+                          "mask %p\n", closure, env, penv ? *penv : 0);
+            const char* ecaps = getenv("WIEEN_ENVCAPS");
+            if (penv)
+            {
+                /*
+                 * In the thread of the game the script is a chunk of ours,
+                 * so no sandbox context of the client points at it.  Lend it
+                 * the full set by default; WIEEN_ENVCAPS=0 turns that off and
+                 * any other value picks a mask explicitly.
+                 */
+                g_env_mask = (ecaps && *ecaps) ? strtoull(ecaps, 0, 0)
+                                               : ~0ULL;
+                *penv = &g_env_mask;
+                lenved = 1;
+                wieen_log("wieen: the caps of the env are lent as %#llx "
+                          "(was %p)\n", g_env_mask, savedenv);
+            }
+
+            unsigned long long* pchk = 0;
+            unsigned long long savedchk = 0;
+            const char* ckcaps = getenv("WIEEN_CHECKERCAPS");
+            if (ckcaps && *ckcaps)
+            {
+                typedef void* (*fn_single)(void*, int);
+                fn_single single = (fn_single)(g_base + 0x2992ee0UL);
+                void* chk = single((void*)(g_base + 0x6f85d50UL), 0);
+                if (chk && is_mapped((char*)chk + 0x38))
+                {
+                    pchk = (unsigned long long*)((char*)chk + 0x30);
+                    savedchk = *pchk;
+                    *pchk = strtoull(ckcaps, 0, 0);
+                    *(void**)((char*)chk + 0x38) = 0;
+                    wieen_log("wieen: the caps of the checker are lent as "
+                              "%#llx (was %#llx)\n", *pchk, savedchk);
+                }
+            }
+
             int rc = wieen_pcall(parent, 0, 1, 0);
 
+            if (pchk)
+            {
+                *pchk = savedchk;
+                wieen_log("wieen: the caps of the checker are %#llx again\n",
+                          savedchk);
+            }
+            if (lenved)
+            {
+                *penv = savedenv;
+                wieen_log("wieen: the caps of the env are %p again\n",
+                          savedenv);
+            }
+
+            if (lent64)
+            {
+                *caps64 = savedcaps64;
+                wieen_log("wieen: the caps of the sandbox are %#llx again\n",
+                          *caps64);
+            }
             if (lent)
             {
                 *caps = savedcaps;
@@ -1006,6 +1169,56 @@ static int wieen_pcall(void* L, int nargs, int nresults, int errfunc)
 
     wieen_state_log(rc == 0 ? "after pcall" : "after pcall (error)", L);
     return rc;
+}
+
+/*
+ * The sandbox of a call is not the mask in the state: the accessor at
+ * 0x22ea488 walks the call frames down from ci, takes the innermost Lua
+ * closure, and reads a capability mask from [[closure+0x18]+0x70].  This
+ * prints that chain so the layout can be checked on a live state.
+ */
+static void wieen_log_frames(void* L, void* fnval)
+{
+    char* ci = *(char**)((char*)L + LSTATE_CI);
+    char* baseci = *(char**)((char*)L + 0x18);
+    wieen_log("wieen: the chunk: value %p, ci %p, baseci %p\n", fnval, ci,
+              baseci);
+    void* closure = (fnval && is_mapped(fnval)) ? *(void**)fnval : 0;
+    if (closure && is_mapped(closure))
+    {
+        void* ctx = *(void**)((char*)closure + 0x18);
+        wieen_log("wieen: the chunk: closure %p ctx %p", closure, ctx);
+        if (ctx && is_mapped((char*)ctx + 0x70))
+        {
+            void* mp = *(void**)((char*)ctx + 0x70);
+            wieen_log(" mask ptr %p", mp);
+            if (mp && is_mapped(mp))
+                wieen_log(" mask %#llx", *(unsigned long long*)mp);
+        }
+        wieen_log("\n");
+    }
+    for (int k = 0; k < 8 && ci >= baseci; k++, ci -= 0x30)
+    {
+        char* tv = *(char**)(ci + 8);
+        if (!tv || !is_mapped(tv))
+            continue;
+        void* c2 = *(void**)tv;
+        wieen_log("wieen: frame %d ci %p tv %p tag %d closure %p", k, ci, tv,
+                  *(int*)(tv + 0xc), c2);
+        if (c2 && is_mapped(c2))
+        {
+            void* ctx = *(void**)((char*)c2 + 0x18);
+            wieen_log(" ctx %p", ctx);
+            if (ctx && is_mapped((char*)ctx + 0x70))
+            {
+                void* mp = *(void**)((char*)ctx + 0x70);
+                wieen_log(" mask ptr %p", mp);
+                if (mp && is_mapped(mp))
+                    wieen_log(" mask %#llx", *(unsigned long long*)mp);
+            }
+        }
+        wieen_log("\n");
+    }
 }
 
 /*
