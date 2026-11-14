@@ -34,6 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <setjmp.h>
+#include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -203,10 +205,6 @@ static int env_flag(const char* name)
 
 static void run_pending(void* parent);
 static void run_probe(void* L);
-static void collect_capabilities(unsigned char* g);
-
-/* the richest set of capabilities of the states of the VM */
-static unsigned int g_rich_caps;
 
 /*
  * The state of the game and the callback that is put into it.  The
@@ -221,6 +219,25 @@ static int g_in_preresume;            /* a script of ours is running */
 static int g_probe_wanted;            /* the next hit has to be probed */
 static int g_probe_done;
 static char g_probe_result[160];
+
+/*
+ * The search for the state of the VM reads the memory of the client, and
+ * the game frees it while it runs: a page can be gone between the moment
+ * it is looked at and the moment it is read.  A fault of our own during
+ * the search is therefore not fatal: the search is given up and started
+ * again.
+ */
+static sigjmp_buf g_scan_jmp;
+static volatile int g_scan_active;
+static volatile pid_t g_scan_tid;
+
+
+/*
+ * The state of the VM keeps a pointer to the set of the capabilities of a
+ * thread in the field +0x0c.  The thread of the game that calls us is a
+ * script thread, and its rights are not always enough; the main thread of
+ * the VM has all of them, so its set is used.
+ */
 
 /* ------------------------------------------------------------------ */
 /* a small view of the memory map                                     */
@@ -430,11 +447,9 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
          * copied into it: the mask lives at +0x0c of the state.
          */
         unsigned int caps =
-            *(const unsigned int*)((const unsigned char*)parent + LSTATE_CAPS);
-        /* the sets of the threads are not nested, so they are united */
-        caps |= g_rich_caps;
+            *(unsigned int*)((const unsigned char*)parent + LSTATE_CAPS);
         *(unsigned int*)((unsigned char*)thread + LSTATE_CAPS) = caps;
-        wieen_log("wieen: the capabilities of the thread are %#.x\n", caps);
+        wieen_log("wieen: the capabilities of the thread are %#x\n", caps);
     }
 
     if (thread && env_flag("WIEEN_CAPSCAN"))
@@ -1011,20 +1026,26 @@ static unsigned char* find_global_state(void)
         return 0;
     char line[512];
     unsigned char* found = 0;
-    while (fgets(line, sizeof(line), f))
+    g_scan_tid = (pid_t)syscall(SYS_gettid);
+    if (sigsetjmp(g_scan_jmp, 1) == 0)
     {
-        unsigned long lo, hi;
-        char perms[8] = {0};
-        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3)
-            continue;
-        if (perms[0] != 'r' || perms[1] != 'w')
-            continue;
-        unsigned char* r = scan_region(lo, hi, have_needle ? needle : 0);
-        if (r && !found)
-            found = r;
-        if (found && g_candidate_count >= MAX_CANDIDATES)
-            break;
+        g_scan_active = 1;
+        while (fgets(line, sizeof(line), f))
+        {
+            unsigned long lo, hi;
+            char perms[8] = {0};
+            if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3)
+                continue;
+            if (perms[0] != 'r' || perms[1] != 'w')
+                continue;
+            unsigned char* r = scan_region(lo, hi, have_needle ? needle : 0);
+            if (r && !found)
+                found = r;
+            if (found && g_candidate_count >= MAX_CANDIDATES)
+                break;
+        }
     }
+    g_scan_active = 0;
     fclose(f);
     for (int i = 0; i < g_candidate_count; i++)
         dump_candidate(g_candidates[i]);
@@ -1106,7 +1127,6 @@ static void* selector_thread(void* arg)
                 g_global_state = g_candidates[i];
                 wieen_log("wieen: the state of the game is %p\n",
                           g_global_state);
-                collect_capabilities(g_candidates[i]);
                 return 0;
             }
             remove_preresume();
@@ -1127,70 +1147,16 @@ static void* selector_thread(void* arg)
 }
 
 /*
+ * The set of the capabilities of a thread is a mask in the field +0x0c of
+ * the state.  The thread of the game that calls us has only a part of the
+ * rights, so the sets of all the states of the VM are looked at and united
+ * with it: the sets are not nested, a bit can be missing in one of them.
+ */
+/*
  * The socket waits for the selection when a command comes in: the script
  * has to run in the VM of the game, and the VM is only known once it has
  * answered the probe.
  */
-/*
- * The states of the VM have different sets of capabilities: the thread of a
- * script may create nothing, while the thread of the game creates
- * instances.  The richest set of the VM is looked up here, so the thread
- * of the agent is as capable as the game itself.
- */
-static void collect_capabilities(unsigned char* g)
-{
-    const unsigned long chunk = 64UL << 20;
-    size_t pages = chunk >> 12;
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (!f)
-        return;
-    char line[512];
-    while (fgets(line, sizeof(line), f))
-    {
-        unsigned long lo, hi;
-        char perms[8] = {0};
-        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3)
-            continue;
-        if (perms[0] != 'r' || perms[1] != 'w')
-            continue;
-        unsigned char* vec = malloc(pages);
-        if (!vec)
-            continue;
-        for (unsigned long base = lo; base < hi; base += chunk)
-        {
-            unsigned long len = hi - base < chunk ? hi - base : chunk;
-            if (mincore((void*)base, len, vec) != 0)
-                continue;
-            size_t npages = (len + 0xFFF) >> 12;
-            for (size_t p = 0; p < npages; p++)
-            {
-                if (!(vec[p] & 1))
-                    continue;
-                unsigned long page = base + (p << 12);
-                for (unsigned long q = page; q + 8 <= page + 4096; q += 8)
-                {
-                    if (*(unsigned long*)q != (unsigned long)g)
-                        continue;
-                    unsigned long l = q - LSTATE_GLOBAL;
-                    if (!plausible_state((unsigned char*)l, (unsigned long)g, lo, hi))
-                        continue;
-                    unsigned int caps =
-                        *(unsigned int*)((char*)l + LSTATE_CAPS);
-                    if (caps > g_rich_caps)
-                    {
-                        g_rich_caps = caps;
-                        wieen_log("wieen: the state %p has the capabilities "
-                                  "%#x\n", (void*)l, caps);
-                    }
-                }
-            }
-        }
-        free(vec);
-    }
-    fclose(f);
-    wieen_log("wieen: the richest set of capabilities is %#x\n", g_rich_caps);
-}
-
 static int ensure_preresume(void)
 {
     if (g_global_state)
@@ -1216,6 +1182,16 @@ static struct sigaction g_old_action[WIEEN_FAULTS];
 
 static void wieen_crash(int sig, siginfo_t* info, void* uc)
 {
+    /*
+     * A fault of the search for the state is ours: the page the game has
+     * just freed is read.  The search is given up, the game is not hurt.
+     */
+    if (g_scan_active && (pid_t)syscall(SYS_gettid) == g_scan_tid)
+    {
+        g_scan_active = 0;
+        siglongjmp(g_scan_jmp, 1);
+    }
+
     /*
      * The fault is not ours to swallow, and this handler runs on whatever
      * thread the signal landed on, possibly in the middle of malloc: the
@@ -1762,12 +1738,12 @@ static void* setup_thread(void* arg)
     }
 
     /*
-     * The handlers of the game are only watched when somebody asks for
-     * it: taking over a fault the game handles itself would turn a
-     * recoverable trap of the client into a dead process.
+     * The handlers of the game are watched, but they are given the fault
+     * back untouched: a fault of the game is the game's own business.  Only
+     * a fault of the search for the state is caught by us, and it does not
+     * reach this point.
      */
-    if (env_flag("WIEEN_FAULTLOG"))
-        install_crash_handler();
+    install_crash_handler();
     refresh_maps();
 
     unsigned long long hash = hash_image(g_base, 16 * 1024 * 1024);
