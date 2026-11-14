@@ -100,7 +100,10 @@ def main() -> int:
     subprocess.run(["flatpak", "kill", "org.vinegarhq.Sober"], capture_output=True)
     time.sleep(2)
     log = open("/tmp/opencode/sober_selftest.log", "wb")
-    subprocess.Popen(["flatpak", "run", "org.vinegarhq.Sober"],
+    # the launcher forwards the WIEEN_* switches of this shell into the
+    # sandbox, so a test runs with the same agent configuration as a manual
+    # `wieen launch`
+    subprocess.Popen([sys.executable, str(REPO / "src/cli/wieen.py"), "launch"],
                      stdout=log, stderr=log, stdin=subprocess.DEVNULL,
                      start_new_session=True)
 

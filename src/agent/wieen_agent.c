@@ -59,7 +59,9 @@
 typedef int (*fn_load)(void* L, const char* chunkname, const char* data,
                         unsigned long size, int env);
 typedef int (*fn_resume)(void* L, void* from, int nargs);
-typedef int (*fn_pcall)(void* L, int nargs, int nresults, int errfunc);
+typedef void (*fn_dcall)(void* L, void* func, int nresults, int preparereentry);
+typedef int (*fn_raw_pcall)(void* L, void (*func)(void*, void*), void* ud,
+                            long oldtop, long errfunc);
 /* the compiler of Luau as it is in the client: char* f(const char* source,
  * size_t size, void* options, size_t* outsize) */
 typedef char* (*fn_compile)(const char* source, unsigned long size,
@@ -121,9 +123,19 @@ static const struct signature SIGNATURES[] = {
 /* the first 16 MiB of the client the tables were made for */
 #define WIEEN_KNOWN_HASH 0x18d8af04a276288dULL
 
+/*
+ * The client has no standalone lua_pcall: its lapi call was inlined, and only
+ * luaD_pcall and luaD_call remain.  Both addresses are fixed RVAs of the game
+ * VM copy, validated against the known client image.  A pcall is rebuilt from
+ * them exactly as upstream lapi.cpp does it.
+ */
+#define LUA_RVA_D_PCALL 0x22e5729UL
+#define LUA_RVA_D_CALL 0x22e5b93UL
+
 static fn_load g_load;
 static fn_compile g_compile;
-static fn_pcall g_pcall;
+static fn_raw_pcall g_pcall;
+static fn_dcall g_dcall;
 static fn_resume g_resume;
 static fn_newthread g_newthread;
 static fn_tolstring g_tolstring;
@@ -213,6 +225,7 @@ static int env_flag(const char* name)
 
 static void run_pending(void* parent);
 static void run_probe(void* L);
+static int wieen_pcall(void* L, int nargs, int nresults, int errfunc);
 
 /*
  * The state of the game and the callback that is put into it.  The
@@ -230,6 +243,9 @@ static char g_probe_result[160];
 
 /* the union of the sets of the capabilities of the states of the VM */
 static unsigned int g_rich_caps;
+
+/* set while the fallback runs a script outside the thread of the game */
+static int g_inthread_off;
 
 /* the socket of the host: it compiles the sources the script asks for */
 static int g_conn_fd = -1;
@@ -420,6 +436,7 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
     int loadstatus = -1;
     ptrdiff_t savedoffset = 0;
     char* savedtop = 0;
+    int fallback = 0;
     wieen_log("wieen: running a script after %lu resumes of the game\n",
               g_preresume_hits);
     wieen_log("wieen: creating thread for %lu bytes in parent %p\n",
@@ -541,7 +558,8 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
          * the sandbox and the context of the game, and its print goes to
          * the console of the game and not only to the log.
          */
-        int inthread = env_flag("WIEEN_INTHREAD") && g_pcall != 0;
+        int inthread = env_flag("WIEEN_INTHREAD") && g_pcall && g_dcall &&
+                       !g_inthread_off;
         void* rt = inthread ? parent : thread;
         if (inthread)
         {
@@ -584,7 +602,58 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             char** pbase = (char**)((char*)parent + LSTATE_BASE);
             wieen_log("wieen: the stack of the game: base %p top %p\n",
                       (void*)*pbase, (void*)*ptop);
-            int rc = g_pcall(parent, 0, 1, 0);
+
+            /*
+             * The thread of the game runs our chunk with the rights it has
+             * at that moment, and they are not the rights of a script.  The
+             * mask is data of the state, so a wider mask can be lent for the
+             * call and given back afterwards.  WIEEN_GAMECAPS=<mask> says
+             * which mask to lend.
+             */
+            unsigned int* caps =
+                (unsigned int*)((unsigned char*)parent + LSTATE_CAPS);
+            unsigned int savedcaps = *caps;
+            const char* gcaps = getenv("WIEEN_GAMECAPS");
+            int lent = 0;
+            if (gcaps && *gcaps)
+            {
+                *caps = (unsigned int)strtoul(gcaps, 0, 0);
+                lent = 1;
+                wieen_log("wieen: the mask of the game is lent as %#x (was "
+                          "%#x)\n", *caps, savedcaps);
+            }
+            else
+            {
+                /*
+                 * A sweep of the masks has to be done without restarting the
+                 * client: the value is read from a file before every call.
+                 */
+                const char* capfile = getenv("WIEEN_CAPSFILE");
+                if (capfile && *capfile)
+                {
+                    FILE* f = fopen(capfile, "r");
+                    if (f)
+                    {
+                        unsigned long v = 0;
+                        if (fscanf(f, "%lx", &v) == 1)
+                        {
+                            *caps = (unsigned int)v;
+                            lent = 1;
+                            wieen_log("wieen: the mask of the game is lent as "
+                                      "%#lx (was %#x)\n", v, savedcaps);
+                        }
+                        fclose(f);
+                    }
+                }
+            }
+
+            int rc = wieen_pcall(parent, 0, 1, 0);
+
+            if (lent)
+            {
+                *caps = savedcaps;
+                wieen_log("wieen: the mask of the game is %#x again\n", *caps);
+            }
             wieen_log("wieen: lua_pcall returned %d, the stack of the game: "
                       "base %p top %p\n", rc, (void*)*pbase, (void*)*ptop);
             for (int k = 1; k <= 3; k++)
@@ -596,9 +665,31 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             status = rc;
             if (rc != 0)
             {
-                *message = "the script failed in the thread of the game";
-                *messagelen = strlen(*message);
-                status = -1;
+                /*
+                 * A script that yields cannot be continued from here: the
+                 * call is not yieldable, so the yield of the game refuses it.
+                 * Such a script is run outside the thread of the game, in a
+                 * thread of its own, where the resume loop handles waiting.
+                 */
+                size_t whylen = 0;
+                const char* why = g_tolstring(parent, -1, &whylen);
+                wieen_log("wieen: the script failed in the thread of the "
+                          "game: %s\n", why ? why : "(no message)");
+                if (why && (strstr(why, "yieldable") ||
+                            strstr(why, "yield across")))
+                {
+                    wieen_log("wieen: the script yields, it runs outside the "
+                              "thread of the game\n");
+                    *ptop = savedtop;
+                    fallback = 1;
+                    status = 0;
+                }
+                else
+                {
+                    *message = "the script failed in the thread of the game";
+                    *messagelen = strlen(*message);
+                    status = -1;
+                }
             }
             else
             {
@@ -742,11 +833,28 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                       status, *(unsigned char*)((char*)thread + LSTATE_STATUS),
                       resumes);
         }
-        wieen_log("wieen: reading result\n");
-        size_t resultlen = 0;
-        *message = g_tolstring(rt, -1, &resultlen);
-        *messagelen = resultlen;
-        if (!*message)
+
+        if (fallback)
+        {
+            /*
+             * The same chunk, run the old way: a thread of its own and the
+             * resume loop of the agent, which continues a script that yields.
+             * The stack of the game was already put back, so the second run
+             * starts from the same place.
+             */
+            g_inthread_off = 1;
+            status = run_one(parent, chunk, bclen, message, messagelen);
+            g_inthread_off = 0;
+        }
+
+        if (!fallback)
+        {
+            wieen_log("wieen: reading result\n");
+            size_t resultlen = 0;
+            *message = g_tolstring(rt, -1, &resultlen);
+            *messagelen = resultlen;
+        }
+        if (!fallback && !*message)
         {
             /*
              * lua_tolstring only knows strings and numbers; for the
@@ -784,7 +892,7 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
         }
     }
 
-    if (env_flag("WIEEN_INTHREAD") && g_pcall != 0)
+    if (env_flag("WIEEN_INTHREAD") && g_pcall && g_dcall)
     {
         /* the stack of the thread of the game is put back as it was */
         char** stack = (char**)((char*)parent + LSTATE_STACK);
@@ -830,6 +938,70 @@ static unsigned long read_u32(const unsigned char* p)
 {
     return (unsigned long)p[0] | ((unsigned long)p[1] << 8) |
            ((unsigned long)p[2] << 16) | ((unsigned long)p[3] << 24);
+}
+
+/*
+ * lua_pcall of upstream lapi.cpp, rebuilt over the two functions the client
+ * still has.  CallS and f_call are the upstream layout: luaD_pcall catches
+ * the error and restores the stack, luaD_call calls the function.
+ */
+struct wieen_CallS
+{
+    void* func;
+    int nresults;
+};
+
+static void wieen_f_call(void* L, void* ud)
+{
+    struct wieen_CallS* c = (struct wieen_CallS*)ud;
+    g_dcall(L, c->func, c->nresults, 0);
+}
+
+static void wieen_state_log(const char* tag, void* L)
+{
+    if (!env_flag("WIEEN_STATELOG"))
+        return;
+    char* stack = *(char**)((char*)L + LSTATE_STACK);
+    char* top = *(char**)((char*)L + LSTATE_TOP);
+    char* base = *(char**)((char*)L + LSTATE_BASE);
+    char* ci = *(char**)((char*)L + LSTATE_CI);
+    char* baseci = *(char**)((char*)L + 0x18);
+    wieen_log("wieen: [%s] status=%d active=%d nCcalls=%u baseCcalls=%u "
+              "ci=%ld baseci=%ld base=%ld top=%ld\n", tag,
+              (int)*(unsigned char*)((char*)L + LSTATE_STATUS),
+              (int)*(unsigned char*)((char*)L + LSTATE_ACTIVE),
+              (unsigned)*(unsigned short*)((char*)L + LSTATE_NCCALLS),
+              (unsigned)*(unsigned short*)((char*)L + LSTATE_BASECALLS),
+              ci && baseci ? (long)(ci - baseci) : -1L,
+              (long)(base - stack), (long)(base ? base - stack : 0),
+              (long)(top - stack));
+}
+
+static int wieen_pcall(void* L, int nargs, int nresults, int errfunc)
+{
+    char* stack = *(char**)((char*)L + LSTATE_STACK);
+    char* top = *(char**)((char*)L + LSTATE_TOP);
+    unsigned char* status = (unsigned char*)L + LSTATE_STATUS;
+    unsigned char saved = *status;
+    struct wieen_CallS c;
+    c.func = top - 16 * (nargs + 1);
+    c.nresults = nresults;
+    (void)errfunc;
+
+    wieen_state_log("before pcall", L);
+
+    /*
+     * preresume is called while the resumed thread still says LUA_YIELD.
+     * luaD_call/performcall only runs the function when the status is OK, so
+     * the status is made ordinary for the nested call and put back afterwards;
+     * the resume body owns the real transition.
+     */
+    *status = 0;
+    int rc = g_pcall(L, wieen_f_call, &c, (char*)c.func - stack, 0);
+    *status = saved;
+
+    wieen_state_log(rc == 0 ? "after pcall" : "after pcall (error)", L);
+    return rc;
 }
 
 /*
@@ -1822,6 +1994,12 @@ static int read_exact(int fd, void* buf, size_t len)
     while (got < len)
     {
         ssize_t n = read(fd, (char*)buf + got, len - got);
+        /*
+         * A signal of the game interrupts the read: that is not the end of
+         * the connection, the rest of the message is still on its way.
+         */
+        if (n < 0 && errno == EINTR)
+            continue;
         if (n <= 0)
             return -1;
         got += (size_t)n;
@@ -1835,6 +2013,8 @@ static int write_exact(int fd, const void* buf, size_t len)
     while (put < len)
     {
         ssize_t n = write(fd, (const char*)buf + put, len - put);
+        if (n < 0 && errno == EINTR)
+            continue;
         if (n <= 0)
         {
             if (env_flag("WIEEN_SOCKET_LOG"))
@@ -2159,13 +2339,29 @@ static void* setup_thread(void* arg)
         }
     }
 
+    if (hash == WIEEN_KNOWN_HASH)
+    {
+        g_pcall = (fn_raw_pcall)((unsigned char*)g_base + LUA_RVA_D_PCALL);
+        g_dcall = (fn_dcall)((unsigned char*)g_base + LUA_RVA_D_CALL);
+        wieen_log("wieen: luaD_pcall at %p, luaD_call at %p\n",
+                  (void*)g_pcall, (void*)g_dcall);
+    }
+
     const char* altpcall = getenv("WIEEN_ALTPCALL");
     if (altpcall && *altpcall)
     {
         unsigned long off = strtoul(altpcall, 0, 0);
-        g_pcall = (fn_pcall)((unsigned char*)g_base + off);
-        wieen_log("wieen: lua_pcall is taken from %p (offset %#lx)\n",
+        g_pcall = (fn_raw_pcall)((unsigned char*)g_base + off);
+        wieen_log("wieen: luaD_pcall is taken from %p (offset %#lx)\n",
                   (void*)g_pcall, off);
+    }
+    const char* altdcall = getenv("WIEEN_ALTD_CALL");
+    if (altdcall && *altdcall)
+    {
+        unsigned long off = strtoul(altdcall, 0, 0);
+        g_dcall = (fn_dcall)((unsigned char*)g_base + off);
+        wieen_log("wieen: luaD_call is taken from %p (offset %#lx)\n",
+                  (void*)g_dcall, off);
     }
 
     /*

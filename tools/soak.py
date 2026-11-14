@@ -65,6 +65,30 @@ def send(sock: socket.socket, source: str, raw: bool) -> str:
     return data.decode(errors="replace")
 
 
+def send_retry(sock: socket.socket | None, source: str, raw: bool):
+    """Send a snippet, reconnecting once if the socket died on the way.
+
+    A long session outlives single connections; a broken pipe says nothing
+    about the client, so the test asks again on a fresh one.
+    """
+    if sock is None:
+        sock = connect(time.time() + 10)
+    try:
+        return send(sock, source, raw), sock
+    except OSError:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        sock = connect(time.time() + 10)
+        if sock is None:
+            return "the agent is gone", None
+        try:
+            return send(sock, source, raw), sock
+        except OSError as error:
+            return f"the socket broke twice: {error}", sock
+
+
 def alive(proc: subprocess.Popen | None = None) -> bool:
     # the client lives in a pid namespace of its own, so the host can only
     # see the instance flatpak started
@@ -114,12 +138,10 @@ def main() -> int:
     failures = 0
     for i, snippet in enumerate(SNIPPETS, 1):
         started = time.time()
-        try:
-            result = send(sock, snippet, raw)
-        except OSError as error:
-            result = f"the socket broke: {error}"
+        result, sock = send_retry(sock, snippet, raw)
         took = time.time() - started
-        ok = not result.startswith("error") and "did not run" not in result
+        ok = not result.startswith("error") and "did not run" not in result \
+            and not result.startswith("the ")
         if not ok:
             failures += 1
         print(f"[{i}] {snippet[:44]!r}\n    -> {result[:120]!r} ({took:.2f}s){'' if ok else ' - FAILED'}")
