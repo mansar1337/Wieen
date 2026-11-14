@@ -60,6 +60,10 @@ typedef int (*fn_load)(void* L, const char* chunkname, const char* data,
                         unsigned long size, int env);
 typedef int (*fn_resume)(void* L, void* from, int nargs);
 typedef int (*fn_pcall)(void* L, int nargs, int nresults, int errfunc);
+/* the compiler of Luau as it is in the client: char* f(const char* source,
+ * size_t size, void* options, size_t* outsize) */
+typedef char* (*fn_compile)(const char* source, unsigned long size,
+                            void* options, unsigned long* outsize);
 typedef void* (*fn_newthread)(void* L);
 typedef const char* (*fn_tolstring)(void* L, int idx, unsigned long* len);
 
@@ -118,6 +122,7 @@ static const struct signature SIGNATURES[] = {
 #define WIEEN_KNOWN_HASH 0x18d8af04a276288dULL
 
 static fn_load g_load;
+static fn_compile g_compile;
 static fn_pcall g_pcall;
 static fn_resume g_resume;
 static fn_newthread g_newthread;
@@ -639,6 +644,45 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                  * source and waits.  The host compiles it - the client has
                  * no working loadstring - and the result is loaded here.
                  */
+                if (g_compile && g_conn_fd >= 0)
+                {
+                    /*
+                     * The client has its own compiler: the source is
+                     * compiled inside it, so the bytecode is in the format
+                     * of the client and needs no translation.
+                     */
+                    size_t srclen = 0;
+                    const char* src = g_tolstring(thread, -1, &srclen);
+                    if (src && srclen && srclen < 65536)
+                    {
+                        unsigned long outsize = 0;
+                        char* code = g_compile(src, srclen, 0, &outsize);
+                        wieen_log("wieen: the client compiled %lu bytes into "
+                                  "%lu bytes\n", (unsigned long)srclen, outsize);
+                        if (code && outsize > 8 && outsize < 0x10000 &&
+                            code[0] >= 3 && code[0] <= 14)
+                        {
+                            int st = g_load(thread, "=wieen", code, outsize, 0);
+                            free(code);
+                            wieen_log("wieen: the compiled chunk is loaded, "
+                                      "load returned %d\n", st);
+                            if (st == 0)
+                            {
+                                status = g_resume(thread, parent, 1);
+                                if (status != 1)
+                                    break;
+                                continue;
+                            }
+                            status = -1;
+                            *message = "the client could not load the "
+                                      "compiled chunk";
+                            *messagelen = strlen(*message);
+                            break;
+                        }
+                        free(code);
+                    }
+                }
+
                 if (g_conn_fd >= 0)
                 {
                     size_t srclen = 0;
@@ -2087,6 +2131,34 @@ static void* setup_thread(void* arg)
      * VM.  The offset can be given by hand:
      * WIEEN_ALTPCALL=<offset of lua_pcall in the image>.
      */
+    /*
+     * The compiler of Luau inside the client: the source of a loadstring is
+     * compiled by the client itself, so the bytecode is in its format.
+     */
+    /*
+     * The compiler of Luau inside the client: the source of a loadstring is
+     * compiled by the client itself, so the bytecode is in the format of the
+     * client and needs no translation.  WIEEN_CLICOMP=<offset> picks another
+     * copy of the compiler.
+     */
+    {
+        /*
+         * The client has its own compiler of Luau (the Roblox wrapper of
+         * it is at 0x26d6400), but its calling convention is not the one of
+         * upstream Luau: the source is the third argument there.  So it is
+         * only used when the offset is given by hand:
+         * WIEEN_CLICOMP=<offset>.
+         */
+        const char* clicomp = getenv("WIEEN_CLICOMP");
+        if (clicomp && *clicomp)
+        {
+            unsigned long off = strtoul(clicomp, 0, 0);
+            g_compile = (fn_compile)((unsigned char*)g_base + off);
+            wieen_log("wieen: the compiler of the client is at %p (offset %#lx)\n",
+                      (void*)g_compile, off);
+        }
+    }
+
     const char* altpcall = getenv("WIEEN_ALTPCALL");
     if (altpcall && *altpcall)
     {
