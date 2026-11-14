@@ -125,6 +125,7 @@ python3 tools/soak.py 60            # ждём 6 из 6 и «client is still the
 | `WIEEN_INTHREAD=1` | выполнять скрипт в потоке игры (вызов собран из `luaD_pcall` + `luaD_call`) |
 | `WIEEN_STATELOG=1` | состояние потока до и после вызова: `status active nCcalls baseCcalls ci baseci base top` |
 | `WIEEN_GAMECAPS=<маска>`, `WIEEN_CAPSFILE=<файл>` | одолжить потоку игры другую маску прав на время вызова (файл читается перед каждым вызовом — для перебора без перезапуска) |
+| `WIEEN_WANTCAPS=<маска>`, `WIEEN_WANTFILE=<файл>` | выполнять скрипт только в потоке игры, у которого есть эти биты прав; остальные потоки пропускаются |
 | `WIEEN_ALTPCALL=<смещение>` | `luaD_pcall`, которым пользоваться (по умолчанию `0x22e5729`) |
 | `WIEEN_ALTD_CALL=<смещение>` | `luaD_call`, которым пользоваться (по умолчанию `0x22e5b93`) |
 | `WIEEN_CLICOMP=<смещение>` | компилятор Luau внутри клиента |

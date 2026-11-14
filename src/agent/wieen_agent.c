@@ -247,6 +247,10 @@ static unsigned int g_rich_caps;
 /* set while the fallback runs a script outside the thread of the game */
 static int g_inthread_off;
 
+/* the mask a thread of the game must have for the script to run in it */
+static unsigned int g_want_caps;
+static unsigned long g_caps_skipped;
+
 /* the socket of the host: it compiles the sources the script asks for */
 static int g_conn_fd = -1;
 
@@ -1266,6 +1270,32 @@ static void wieen_preresume(void* L)
     }
     else if (__atomic_load_n(&g_pending_ready, __ATOMIC_RELAXED))
     {
+        if (g_want_caps && env_flag("WIEEN_INTHREAD"))
+        {
+            /*
+             * The resumed threads of the game carry different masks: a
+             * script of the game has rights a renderer thread does not.
+             * WIEEN_WANTCAPS=<mask> says which rights the thread must have
+             * for our script to run in it; the others are skipped and the
+             * chunk waits for a better one.
+             */
+            unsigned int caps =
+                *(unsigned int*)((char*)L + LSTATE_CAPS);
+            if ((caps & g_want_caps) != g_want_caps)
+            {
+                unsigned long skipped = __atomic_add_fetch(&g_caps_skipped, 1,
+                                                           __ATOMIC_RELAXED);
+                if (skipped == 1 || (skipped % 2000) == 0)
+                    wieen_log("wieen: the mask %#x is not the one asked for "
+                              "(%#x), %lu threads skipped\n", caps,
+                              g_want_caps, skipped);
+                g_in_preresume = 0;
+                return;
+            }
+            wieen_log("wieen: the mask %#x is the one asked for, running "
+                      "here\n", caps);
+            g_want_caps = 0;
+        }
         if (state_is_usable(L))
             run_pending(L);
         else
@@ -2102,12 +2132,33 @@ static void serve(int fd)
         if (len && read_exact(fd, g_pending, len) != 0)
             return;
 
+        /*
+         * Which thread of the game this command wants, if any: the mask is
+         * re-read for every command, so a sweep does not need a restart.
+         */
+        g_want_caps = 0;
+        g_caps_skipped = 0;
+        const char* want = getenv("WIEEN_WANTCAPS");
+        if (want && *want)
+            g_want_caps = (unsigned int)strtoul(want, 0, 0);
+        const char* wantfile = getenv("WIEEN_WANTFILE");
+        if (wantfile && *wantfile)
+        {
+            FILE* wf = fopen(wantfile, "r");
+            if (wf)
+            {
+                unsigned long v = 0;
+                if (fscanf(wf, "%lx", &v) == 1)
+                    g_want_caps = (unsigned int)v;
+                fclose(wf);
+            }
+        }
+
         pthread_mutex_lock(&g_lock);
         g_pending_len = len;
         g_pending_ready = 1;
         pthread_cond_broadcast(&g_done);
         pthread_mutex_unlock(&g_lock);
-
         /* wait for the game to run it */
         struct timespec deadline;
         clock_gettime(CLOCK_REALTIME, &deadline);
