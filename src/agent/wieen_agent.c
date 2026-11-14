@@ -38,6 +38,7 @@
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -224,6 +225,9 @@ static char g_probe_result[160];
 
 /* the union of the sets of the capabilities of the states of the VM */
 static unsigned int g_rich_caps;
+
+/* the socket of the host: it compiles the sources the script asks for */
+static int g_conn_fd = -1;
 
 /* the masks of the capabilities of the states of the VM */
 #define CAP_MASKS 32
@@ -463,6 +467,26 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
         *(unsigned int*)((unsigned char*)thread + LSTATE_CAPS) = caps;
         wieen_log("wieen: the capabilities of the thread are %#x\n", caps);
 
+        if (env_flag("WIEEN_CTXSCAN"))
+        {
+            /*
+             * The context of a script is a chain: every node has the next
+             * one at +0x60, and a flag at +0x8f4.  The thread of the game
+             * has such a chain, ours has none, so the field that holds it
+             * is looked for in the state of the thread of the game.
+             */
+            for (int off = 0; off < 0x80; off += 8)
+            {
+                unsigned long v = *(unsigned long*)((char*)parent + off);
+                if (!v || !is_mapped((void*)v))
+                    continue;
+                unsigned long next = *(unsigned long*)((char*)v + 0x60);
+                unsigned int flag = *(unsigned int*)((char*)v + 0x8f4);
+                wieen_log("wieen:   +%#x -> %p, the next is %p, the flag is "
+                          "%#x\n", off, (void*)v, (void*)next, flag);
+            }
+        }
+
         const char* copy = getenv("WIEEN_COPYOFF");
         if (copy && *copy)
         {
@@ -609,6 +633,59 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                 status = g_resume(thread, parent, 0);
                 if (status != 1)
                     break;
+
+                /*
+                 * The script asked for a chunk to be compiled: it gave the
+                 * source and waits.  The host compiles it - the client has
+                 * no working loadstring - and the result is loaded here.
+                 */
+                if (g_conn_fd >= 0)
+                {
+                    size_t srclen = 0;
+                    const char* src = g_tolstring(thread, -1, &srclen);
+                    if (src && srclen && srclen < 65536)
+                    {
+                        char req[9 + 65536];
+                        memcpy(req, "\x00" "compile:", 9);
+                        memcpy(req + 9, src, srclen);
+                        unsigned int n = (unsigned int)(9 + srclen);
+                        if (write(g_conn_fd, &n, 4) == 4 &&
+                            write(g_conn_fd, req, n) == (ssize_t)n)
+                        {
+                            unsigned int rl = 0;
+                            if (read(g_conn_fd, &rl, 4) == 4 && rl > 10)
+                            {
+                                char* buf = (char*)malloc(rl);
+                                if (buf && read(g_conn_fd, buf, rl) == (ssize_t)rl &&
+                                    memcmp(buf, "\x00" "compiled:", 10) == 0)
+                                {
+                                    int st = g_load(thread, "=wieen", buf + 10,
+                                                    rl - 10, 0);
+                                    wieen_log("wieen: the host compiled the "
+                                              "source, %u bytes, load returned "
+                                              "%d\n", rl - 10, st);
+                                    free(buf);
+                                    if (st == 0)
+                                    {
+                                        /* the function is on the stack: it
+                                         * is the result of the yield */
+                                        status = g_resume(thread, parent, 1);
+                                        if (status != 1)
+                                            break;
+                                        continue;
+                                    }
+                                    status = -1;
+                                    *message = "the host could not compile "
+                                              "the source";
+                                    *messagelen = strlen(*message);
+                                    break;
+                                }
+                                free(buf);
+                            }
+                        }
+                    }
+                }
+
                 if (++resumes > 10000)
                 {
                     status = -1;
@@ -623,10 +700,7 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
         }
         wieen_log("wieen: reading result\n");
         size_t resultlen = 0;
-        int index = -1;
-        if (status == 0 && env_flag("WIEEN_INTHREAD") && g_pcall != 0)
-            index = -2;  /* the result is under the top of the stack */
-        *message = g_tolstring(rt, index, &resultlen);
+        *message = g_tolstring(rt, -1, &resultlen);
         *messagelen = resultlen;
         if (!*message)
         {
@@ -635,8 +709,6 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
              * other types the tag of the value is read from the stack.
              */
             char* top = *(char**)((char*)rt + LSTATE_TOP);
-            if (index == -2)
-                top -= 16;
             if (is_mapped(top) && is_mapped(top - 16))
             {
                 char* value = top - 16;
@@ -1788,6 +1860,13 @@ static void serve(int fd)
                 return;
             continue;
         }
+
+        /* the socket of the host is where the sources are compiled */
+        g_conn_fd = fd;
+        struct timeval tv;
+        tv.tv_sec = 30;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         pthread_mutex_lock(&g_lock);
         g_pending_len = 0;

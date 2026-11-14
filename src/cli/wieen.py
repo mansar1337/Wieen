@@ -118,6 +118,19 @@ def preload_hint() -> str:
 # ---------------------------------------------------------------- protocol
 
 
+BOOTSTRAP = """\
+-- the client has no working loadstring: it refuses the call because the
+-- thread has no context of a script.  This one hands the source to the
+-- host, which compiles it, and the agent loads the result.
+--
+-- The local shadows the global one, so the scripts of the game keep
+-- seeing the stub of the client and are not touched.
+local loadstring = function(src)
+    return coroutine.yield(src)
+end
+"""
+
+
 class Agent:
     """Client for the agent's socket protocol: [u32 len][payload]."""
 
@@ -173,10 +186,23 @@ class Agent:
         if self.sock is None and not self.connect():
             raise ConnectionError(f"no agent at {self.path}")
         assert self.sock is not None
-        payload = self.compile(source)
+        # the client has no working loadstring, so the script gets one that
+        # asks this side to compile the source
+        payload = self.compile(BOOTSTRAP + source)
         self.sock.sendall(struct.pack("<I", len(payload)) + payload)
-        (length,) = struct.unpack("<I", self._recv_exact(4))
-        return self._recv_exact(length).decode(errors="replace")
+        while True:
+            (length,) = struct.unpack("<I", self._recv_exact(4))
+            data = self._recv_exact(length)
+            if not data.startswith(b"\x00compile:"):
+                return data.decode(errors="replace")
+            # the agent wants a chunk compiled
+            source_text = data[len(b"\x00compile:"):].decode(errors="replace")
+            try:
+                code = self.compile(source_text)
+            except Exception as error:  # the script sees the error
+                code = b""
+            reply = b"\x00compiled:" + code
+            self.sock.sendall(struct.pack("<I", len(reply)) + reply)
 
 
 # ---------------------------------------------------------------- commands
