@@ -46,6 +46,8 @@
 
 /* the bytecode of the probe, compiled by tools/probe.luau */
 #include "probe_bytecode.h"
+/* the greeting, compiled by tools/toast.luau */
+#include "toast_bytecode.h"
 
 #define LOG_DIR_SUFFIX "/.var/app/org.vinegarhq.Sober/data/wieen"
 #define LOG_FILE_NAME "agent.log"
@@ -231,6 +233,7 @@ static int env_flag(const char* name)
 }
 
 static void run_pending(void* parent);
+static int run_toast(void* L);
 static void run_probe(void* L);
 static void wieen_log_frames(void* L, void* fnval);
 static int wieen_pcall(void* L, int nargs, int nresults, int errfunc);
@@ -341,6 +344,14 @@ static int g_in_preresume;            /* a script of ours is running */
 static int g_probe_wanted;            /* the next hit has to be probed */
 static int g_probe_done;
 static char g_probe_result[160];
+/* the greeting of the experience: 1 while it is waiting to be shown */
+static int g_toast_state;
+/* preresume fires thousands of times a second, so the greeting is tried
+ * on a clock and not on every hit */
+static double g_toast_next;
+/* a chunk of the agent itself runs even when WIEEN_INTHREAD is not asked
+ * for: the greeting needs the rights of the game thread */
+static int g_force_inthread;
 
 /* the union of the sets of the capabilities of the states of the VM */
 static unsigned int g_rich_caps;
@@ -666,8 +677,8 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
          * the sandbox and the context of the game, and its print goes to
          * the console of the game and not only to the log.
          */
-        int inthread = env_flag("WIEEN_INTHREAD") && g_pcall && g_dcall &&
-                       !g_inthread_off;
+        int inthread = (env_flag("WIEEN_INTHREAD") || g_force_inthread) &&
+                       g_pcall && g_dcall && !g_inthread_off;
         void* rt = inthread ? parent : thread;
         if (inthread)
         {
@@ -1555,6 +1566,63 @@ static void run_probe(void* L)
 }
 
 /*
+ * The greeting of the experience.  It runs once the state of the game is
+ * known, in the thread of the game and with the rights lent for the call,
+ * and it is repeated while the place is still coming up ("wait") or the
+ * call fails.  The command of the socket is put aside for the moment.
+ */
+static int run_toast(void* L)
+{
+    static char saved[MAX_MESSAGE];
+    static char savedresult[MAX_MESSAGE];
+    static int attempts;
+    size_t savedlen = 0, savedresultlen = 0;
+    int savedready = 0, savedfinished = 0;
+
+    pthread_mutex_lock(&g_lock);
+    savedlen = g_pending_len;
+    savedready = g_pending_ready;
+    savedfinished = g_finished;
+    savedresultlen = g_result_len;
+    if (savedlen && savedlen < sizeof(saved))
+        memcpy(saved, g_pending, savedlen);
+    if (savedresultlen && savedresultlen < sizeof(savedresult))
+        memcpy(savedresult, g_result, savedresultlen);
+    memcpy(g_pending, wieen_toast, wieen_toast_size);
+    g_pending_len = wieen_toast_size;
+    g_pending_ready = 1;
+    g_finished = 0;
+    g_result_len = 0;
+    g_result[0] = 0;
+    pthread_mutex_unlock(&g_lock);
+
+    g_force_inthread = 1;
+    run_pending(L);
+    g_force_inthread = 0;
+
+    pthread_mutex_lock(&g_lock);
+    attempts++;
+    int waiting = strncmp(g_result, "wait", 4) == 0 ||
+                  strncmp(g_result, "error", 5) == 0;
+    if (!waiting || attempts == 1 || (attempts % 10) == 0)
+        wieen_log("wieen: the greeting, try %d: %s\n", attempts, g_result);
+    if (savedlen && savedlen < sizeof(saved))
+    {
+        memcpy(g_pending, saved, savedlen);
+        g_pending_len = savedlen;
+    }
+    if (savedresultlen && savedresultlen < sizeof(savedresult))
+        memcpy(g_result, savedresult, savedresultlen);
+    g_result_len = savedresultlen;
+    g_pending_ready = savedready;
+    g_finished = savedfinished;
+    pthread_mutex_unlock(&g_lock);
+
+    /* the place is slow to come up: a try a second for ten minutes */
+    return !waiting || attempts > 600;
+}
+
+/*
  * The pre-resume callback in the global state.  Unlike a patch of the text,
  * this pointer lives in writable memory, so the integrity check of the
  * client does not see it.  It is called from lua_resume on the game thread,
@@ -1655,6 +1723,18 @@ static void wieen_preresume(void* L)
         g_probe_wanted = 0;
         g_probe_done = 1;
         run_probe(L);
+    }
+    else if (g_toast_state == 1)
+    {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double t = (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+        if (t >= g_toast_next)
+        {
+            g_toast_next = t + 1.0;
+            if (run_toast(L))
+                g_toast_state = 2;
+        }
     }
     else if (__atomic_load_n(&g_pending_ready, __ATOMIC_RELAXED))
     {
@@ -2035,6 +2115,7 @@ static void* selector_thread(void* arg)
             if (is_experience(name))
             {
                 g_global_state = g_candidates[i];
+                g_toast_state = 1;
                 wieen_log("wieen: the state of the game is %p (%s)\n",
                           g_global_state, name);
                 if (env_flag("WIEEN_RICHCAPS"))
