@@ -1,133 +1,206 @@
-# Wieen
+<p align="center">
+  <img src="docs/logo.png" alt="Wieen" width="260">
+</p>
 
-Luau-инжектор для **Sober** (VinegarHQ) — рантайма Roblox на Linux.
+<h1 align="center">Wieen</h1>
 
-Sober запускает Android-клиент Roblox (x86_64) внутри flatpak-песочницы.
-Wieen встраивается в этот клиент, находит состояние Luau-VM и выполняет
-Luau-код прямо в игре — с доступом к `game`, `workspace` и всему API игровых
-скриптов.
+<p align="center">
+  A Luau injector for <b>Sober</b> — the Roblox runtime for Linux.
+</p>
 
+<p align="center">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Linux-1f6feb?style=flat-square">
+  <img alt="runtime" src="https://img.shields.io/badge/runtime-Sober%20(VinegarHQ)-8957e5?style=flat-square">
+  <img alt="agent" src="https://img.shields.io/badge/agent-C-3fb950?style=flat-square">
+  <img alt="scripts" src="https://img.shields.io/badge/scripts-Luau-ffb01f?style=flat-square">
+  <img alt="client code" src="https://img.shields.io/badge/client%20code-untouched-d29922?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="README.ru.md">Русская версия</a>
+</p>
+
+---
+
+Sober runs the Android client of Roblox (x86_64) inside a flatpak sandbox.
+Wieen loads itself into that client, finds the Luau VM the game is already
+running, and executes Luau inside it — with `game`, `workspace` and the whole
+API the game's own scripts get.
+
+```console
+$ python3 src/cli/wieen.py exec 'return typeof(game)'
+Instance
+
+$ python3 src/cli/wieen.py exec 'return tostring(workspace.CurrentCamera.FieldOfView)'
+70
+
+$ python3 src/cli/wieen.py exec 'local f = loadstring("return 6*7") return f()'
+42
 ```
-$ python3 tools/quick_test.py 'return typeof(game)' --raw
-connected to the agent
-result: Instance
-```
 
-## Как это устроено
+## Features
 
-```
-хост                          агент (в процессе клиента)        клиент
-────                          ─────────────────────────────       ──────
-wieen-compile  ──байткод──▶  UNIX-сокет
-                              ждёт следующего вызова pre-resume
-                              lua_newthread + luau_load
-                              lua_resume  ──────────────────────▶  VM клиента
-                              читает результат  ◀───────────────
-```
-
-1. **Внедрение.** `tools/install_preload.sh` правит `etc/ld.so.preload` в
-   рантайме GNOME flatpak: `LD_PRELOAD` и `LD_AUDIT` рантайм вырезает, а
-   `ld.so.preload` доходит до процесса клиента (клиента грузит собственный
-   загрузчик `libloader.so`, который всё равно пользуется `ld.so`).
-
-2. **Хук.** Агент находит образ клиента в своём адресном пространстве и ищет
-   `lua_resume`, `luau_load`, `lua_newthread` и `lua_tolstring` по смещениям с
-   проверкой сигнатур. Сам `lua_resume` патчить нельзя: клиент проверяет
-   байты своего кода и уходит примерно через минуту после старта, даже если
-   перекодировать инструкцию в эквивалентную. Поэтому хук ставится в
-   writable-память: агент находит состояние Luau (`global_State`) и кладёт
-   своего обработчика в слот `pre-resume` — указатель, который сам VM
-   вызывает перед каждым своим скриптом. Хук срабатывает, когда игра
-   запускает любой свой скрипт: это безопасное место для чужого кода — тот же
-   поток и то же состояние.
-
-3. **Исполнение.** Агент создаёт поток (`lua_newthread`), грузит в него
-   байткод (`luau_load`) и запускает (`lua_resume`). Состояние игры общее,
-   поэтому доступны `game`, `workspace` и всё остальное.
-
-4. **Свой формат опкодов.** Клиент нумерует опкоды Luau иначе, чем upstream:
-   у него своя внутренняя нумерация (95 живых слотов, разбросанных по
-   `0..254`) и своя нумерация байткода, которую клиент переводит в
-   внутреннюю при загрузке. `tools/opcode_map.py` восстанавливает обе
-   таблицы из образа клиента и генерирует `tools/opcode_map.h`, а
-   `tools/wieen_compile.cpp` переводит байткод перед отправкой.
-
-## Что уже работает
-
-* **Выполнение кода в игре.** Скрипт компилируется на хосте, переводится в
-  формат клиента, грузится его же загрузчиком и выполняется его же VM.
-* **Доступ к игровым объектам.** Поток агента получает те же права
-  (capabilities), что и поток игры, поэтому доступны не только `game` и
-  `workspace`, но и `workspace.CurrentCamera`, инстансы и их свойства.
-* **Три таблицы опкодов клиента** восстановлены и перекрёстно проверены:
-  сопоставление обработчиков клиента с эталонной сборкой Luau совпало с
-  собственной таблицей клиента 95 из 95.
-* **Агент** (`src/agent/wieen_agent.c`) — обычная `.so`: находит образ
-  клиента и состояние его Luau-VM, ставит свой обработчик в слот
-  `pre-resume`, отдаёт UNIX-сокет
-  `~/.var/app/org.vinegarhq.Sober/data/wieen/wieen.sock` и возвращает
-  результат выполнения. Код клиента не меняется ни в байте.
-* **Тесты** (`tools/selftest.py`) — 35 сниппетов (строки, арифметика, таблицы,
-  замыкания, циклы, методы, `game`, ошибки) в одном сеансе Sober; все
-  проходят.
-
-## Что выяснено про ограничения Sober
-
-| ограничение | детали |
+| | |
 |---|---|
-| `LD_PRELOAD` вырезается | Sober убирает его из окружения клиента (`check_security` в логе запуска) |
-| `LD_AUDIT` тоже | внутри песочницы ld.so грузит библиотеки как audit-модули, им нужен символ `la_version` |
-| клиента грузит **не** ld.so | процесс клиента стартует через собственный загрузчик Sober (`libloader.so`), поэтому `LD_PRELOAD` до него не доходит, а `ld.so.preload` — доходит |
-| свои файлы Sober проверяет | подмена `libbadcpu.so` или APK приводит к тому, что рантайм не стартует; APK перекачивается при каждом запуске |
-| клиента нельзя трассировать | клиент уже трассируется рантаймом Sober (`TracerPid`), второй трассировщик не подключится |
-| syscall из чужого кода | seccomp-фильтр убивает клиент на системном вызове из инжектированного кода — поэтому агент не делает syscall'ов во время работы |
+| **Runs in the game's own VM** | No interpreter, no reimplementation: the script is compiled on the host, translated into the client's bytecode format, loaded by the client's own loader and run by the client's own VM. |
+| **Real capabilities** | The chunk is lent the capabilities of the game thread, so `Instance.new`, property writes and camera access work — not just reading `game`. |
+| **No code patching** | Not a single byte of the client is rewritten. The hook lives in the writable callback slot of the Luau state, which the client's integrity check never looks at. |
+| **Long scripts** | Anything past the client's 279-byte loader limit is split at statement boundaries; the pieces share one environment. |
+| **`loadstring`** | Compiled by the host, loaded by the client, returned as a real function. |
+| **Greets the player** | As soon as the experience is selected, the agent posts a `Wieen injected!` notification through the client's own API and writes a line into the F9 console. |
+| **UNIX socket, plain text** | The host talks to the agent over `wieen.sock`; anything that can write to a socket can drive it. |
 
-## Сборка и запуск
+## How it works
 
-```sh
-make agent    # build/wieen_agent.so — агент (и байткод пробы)
-make compile  # build/wieen-compile — хостовый компилятор
-make deploy   # собрать агента и положить его туда, откуда его берёт Sober
-make install  # то же + прописать агента в рантайм flatpak (нужен root)
-make symbols  # пересобрать src/agent/luau_symbols.h под текущий клиент
+```
+host                        agent (inside the client process)      client
+────                        ─────────────────────────────────      ──────
+wieen-compile  ──bytecode──▶  UNIX socket
+                              waits for the next pre-resume
+                              lua_newthread + luau_load
+                              lua_resume  ───────────────────────▶  game VM
+                              reads the result  ◀────────────────
 ```
 
+**1 — Injection.** `tools/install_preload.sh` edits `etc/ld.so.preload` in the
+GNOME flatpak runtime. The runtime strips `LD_PRELOAD` and `LD_AUDIT` from the
+client's environment, but `ld.so.preload` still reaches the client process
+(the client is started by Sober's own `libloader.so`, which goes through
+`ld.so` all the same).
+
+**2 — Hook.** The agent finds the client image in its own address space and
+locates `lua_resume`, `luau_load`, `lua_newthread` and `lua_tolstring` by
+offset, verified against signatures. Patching `lua_resume` itself is not an
+option: the client checks the bytes of its own code and exits about a minute
+after start, even when the instruction is re-encoded into an equivalent one.
+So the hook goes into writable memory instead — the agent finds the Luau
+`global_State` and puts its handler into the `pre-resume` callback slot, the
+pointer the VM calls before every script it runs. That is a safe place for
+foreign code: same thread, same state, right before the game's own work.
+
+**3 — Execution.** The agent creates a thread (`lua_newthread`), loads the
+bytecode into it (`luau_load`) and resumes it (`lua_resume`). The state is
+shared with the game, so everything the game can see is in reach.
+
+**4 — Its own opcode numbering.** The client numbers Luau opcodes differently
+from upstream: it has its own internal mapping (95 live slots scattered over
+`0..254`) and its own bytecode numbering, which it translates to the internal
+one while loading. `tools/opcode_map.py` recovers both tables from the client
+image and generates `tools/opcode_map.h`; `tools/wieen_compile.cpp` translates
+the bytecode before it is sent.
+
+## In-game greeting
+
+When the VM of the experience is chosen, the agent shows the player that it is
+there. Both channels belong to the client itself — no custom ScreenGui:
+
+```lua
+local LOGO = "rbxassetid://96134879839401"   -- docs/logo.png, uploaded once
+
+local sg = game:GetService("StarterGui")
+local opt = {}
+opt.Title = "Wieen injected!"
+opt.Text = "pwned by wieen! t.me/WieenExploit"
+opt.Duration = 10
+opt.Icon = LOGO
+sg:SetCore("SendNotification", opt)
+
+print("pwned by wieen! t.me/WieenExploit")
+```
+
+* `SetCore("SendNotification")` draws the toast in the corner of the screen and
+  the client removes it after `Duration`.
+* `print` lands in the F9 developer console as `FLog::CreatorOutput` — visible
+  in `sober_logs/latest.log` as
+  `Info [FLog::CreatorOutput] pwned by wieen! ...`.
+
+The script lives in `tools/toast.luau`, is compiled into the agent the same
+way as the probe, and runs through the ordinary command path — so it gets the
+same lent capabilities and the same checker guard as your own snippets. While
+the place is still loading it answers `"wait-player"`, `"wait-gui"` or
+`"wait"`, and the agent retries once a second for ten minutes.
+
+## What Sober turned out to forbid
+
+| limitation | details |
+|---|---|
+| `LD_PRELOAD` is stripped | Sober removes it from the client's environment (`check_security` in the launch log) |
+| `LD_AUDIT` as well | Inside the sandbox `ld.so` loads libraries as audit modules, which need a `la_version` symbol |
+| The client is not started by `ld.so` | The client process starts through Sober's own loader (`libloader.so`), so `LD_PRELOAD` never reaches it — but `ld.so.preload` does |
+| Sober checks its own files | Replacing `libbadcpu.so` or the APK makes the runtime refuse to start; the APK is re-downloaded on every launch |
+| The client cannot be traced | The Sober runtime already traces it (`TracerPid`), a second tracer cannot attach |
+| syscalls from foreign code | The seccomp filter kills the client on a system call made from injected code, so the agent makes no syscalls while it works |
+
+## Build
+
 ```sh
-# один раз: поставить агента в рантайм
+make agent    # build/wieen_agent.so — the agent (with the probe bytecode in it)
+make compile  # build/wieen-compile — the host-side compiler
+make deploy   # build the agent and put it where Sober picks it up
+make install  # the same, and register the agent in the flatpak runtime (root)
+make symbols  # regenerate src/agent/luau_symbols.h for the current client
+```
+
+## Run
+
+```sh
+# once: put the agent into the runtime
 make install
 
-# запустить игру
-flatpak run org.vinegarhq.Sober
+# start the game
+python3 src/cli/wieen.py launch
 
-# в другом терминале — выполнить скрипт
+# in another terminal — run a snippet
 python3 src/cli/wieen.py exec 'print("hello world!")'
 
-# или одной командой (сама поднимает и гасит Sober)
+# or drive it end to end (starts Sober, waits for the socket, sends the code)
 python3 tools/quick_test.py 'return "wieen-ok"' --raw
 python3 tools/selftest.py
 ```
 
-Агент грузится при старте клиента, поэтому после `make deploy` игру надо
-перезапустить.
+```
+usage: wieen {install,launch,status,exec,run,repl}
 
-## Структура
+  install   install the agent and preload it in the runtime
+  launch    start Sober with the agent preloaded
+  status    check whether the agent is reachable
+  exec      run a Luau snippet
+  run       run a Luau file
+  repl      interactive session
+```
 
-| путь | что это |
+The agent is loaded when the client starts, so the game has to be restarted
+after `make deploy`.
+
+## Project layout
+
+| path | what it is |
 |---|---|
-| `src/agent/wieen_agent.c` | агент: поиск состояния VM, хук в слоте `pre-resume`, исполнение Luau, UNIX-сокет |
-| `src/agent/luau_symbols.h` | сгенерированные смещения Luau-API в образе клиента |
-| `src/cli/wieen.py` | хостовая CLI |
-| `tools/wieen_compile.cpp` | хостовый компилятор + перевод опкодов в формат клиента |
-| `tools/opcode_map.py` | восстановление нумерации опкодов клиента → `tools/opcode_map.h` |
-| `tools/opcode_map.txt` | таблица «upstream → внутренний слот → wire-номер» |
-| `tools/probe.luau` | проба агента: спрашивает у VM, что она видит (`game`, `workspace`) |
-| `tools/bin2h.py` | бинарник → C-заголовок (байткод пробы попадает в агента при сборке) |
-| `tools/selftest.py` | набор сниппетов, исполняемых в живом клиенте |
-| `tools/quick_test.py` | одиночный скрипт в живом клиенте |
-| `tools/repeat.py` | один сниппет N раз подряд: где сеанс впервые не ответил |
-| `tools/install_preload.sh` | установка агента в рантайм flatpak |
-| `work/luau-src` | эталонная сборка Luau (пин по коммиту) |
-| `work/libs/libroblox.so` | образ клиента, по которому всё восстанавливается |
-| `docs/` | архитектура и подробности реверса |
-| `roadmap.md` | что работает, что мешает, в каком порядке чинить |
-| `agents.md` | устройство репозитория, инварианты, диагностические флаги и грабли |
+| `src/agent/wieen_agent.c` | the agent: finds the VM state, hooks the `pre-resume` slot, runs Luau, serves the UNIX socket |
+| `src/agent/luau_symbols.h` | generated offsets of the Luau API in the client image |
+| `src/cli/wieen.py` | host-side CLI |
+| `tools/wieen_compile.cpp` | host compiler + opcode translation into the client's format |
+| `tools/opcode_map.py` | recovers the client's opcode numbering → `tools/opcode_map.h` |
+| `tools/opcode_map.txt` | the table: upstream → internal slot → wire number |
+| `tools/probe.luau` | the agent's probe: asks the VM what it sees (`game`, `workspace`) |
+| `tools/toast.luau` | the greeting: the client's notification + the F9 line |
+| `tools/bin2h.py` | binary → C header (the probe and toast bytecode go into the agent at build time) |
+| `tools/selftest.py` | a set of snippets run against the live client |
+| `tools/quick_test.py` | one snippet in the live client |
+| `tools/repeat.py` | one snippet N times: where the session first stops answering |
+| `tools/install_preload.sh` | installs the agent into the flatpak runtime |
+| `work/luau-src` | reference Luau build (pinned by commit) |
+| `work/libs/libroblox.so` | the client image everything is recovered from |
+| `docs/` | architecture and reverse-engineering notes |
+| `roadmap.md` | what works, what blocks, what to fix in which order |
+| `agents.md` | the repository's rules, invariants, diagnostic flags and traps |
+
+## Notes
+
+* The client image is analysed offline (`work/libs/libroblox.so`); the agent
+  finds the same functions at runtime either by the image hash (exact offsets)
+  or by signatures, so a client update does not have to break the agent.
+* After a client update, run `make symbols` and rebuild.
+* `loadstring` chunks run in a sandbox of their own: they see our globals, but
+  `Instance.new` inside one is refused (`lacking capability CreateInstances`).
+  Lifting that is tracked in `roadmap.md`.
