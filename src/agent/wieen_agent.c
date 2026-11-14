@@ -39,6 +39,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -209,6 +210,9 @@ static unsigned char g_pending[MAX_MESSAGE];
 static size_t g_pending_len;
 static int g_pending_ready;
 static int g_finished;
+/* a command of the socket is between its start and its answer: the watcher
+ * must not move the hook while a script is in flight */
+static int g_exec_active;
 static char g_result[MAX_MESSAGE];
 static size_t g_result_len;
 
@@ -230,6 +234,99 @@ static void run_pending(void* parent);
 static void run_probe(void* L);
 static void wieen_log_frames(void* L, void* fnval);
 static int wieen_pcall(void* L, int nargs, int nresults, int errfunc);
+static int is_mapped(void* p);
+static void refresh_maps(void);
+
+/* A file in the data directory of the agent asks for a dump of the state
+ * on the next call.  The environment of the client is fixed at launch, so
+ * a flag that has to be read at runtime is cheaper this way. */
+static int take_flag_file(const char* name)
+{
+    char path[512];
+    const char* home = getenv("HOME");
+    if (!home)
+        return 0;
+    snprintf(path, sizeof(path), "%s%s/%s", home, LOG_DIR_SUFFIX, name);
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+    unlink(path);
+    return 1;
+}
+
+/* The map of memory of the agent is a snapshot and the client keeps
+ * mapping more, so a dump asks the kernel about the page itself. */
+static int page_is_mapped(const void* p)
+{
+    unsigned long page = (unsigned long)p & ~0xFFFUL;
+    unsigned char vec[1];
+    return mincore((void*)page, 0x1000, vec) == 0;
+}
+
+/*
+ * The checker of the client is shared by every script of the game and its
+ * cached mask is rewritten by whichever script asks next.  A single lend
+ * before the call therefore races with the client's own scripts, and the
+ * outcome depends on timing.  A small thread holds the cache at the full
+ * set and the lazy callback cleared for as long as the call of the user
+ * runs, so no script of the game can put a smaller set back.
+ */
+static volatile int g_guard_on;
+static unsigned long long* volatile g_guard_at;
+static unsigned long long g_guard_mask;
+static void* volatile g_guard_lazy;
+static unsigned long long g_guard_lazy_val;
+
+static void* guard_loop(void* arg)
+{
+    (void)arg;
+    while (g_guard_on)
+    {
+        if (g_guard_at && *g_guard_at != g_guard_mask)
+            *g_guard_at = g_guard_mask;
+        if (g_guard_lazy && *(unsigned long long*)g_guard_lazy != g_guard_lazy_val)
+            *(unsigned long long*)g_guard_lazy = g_guard_lazy_val;
+        __asm__ __volatile__("pause");
+    }
+    return 0;
+}
+
+static void dump_state_fields(void* L)
+{
+    for (int q = 0; q < 0x60; q += 8)
+        wieen_log("wieen: L+%02x = %p\n", q, *(void**)((char*)L + q));
+    for (int q = 0x10; q <= 0x28; q += 8)
+    {
+        void* p = *(void**)((char*)L + q);
+        if (!p || !page_is_mapped(p))
+        {
+            wieen_log("wieen: [L+%02x] = %p is not mapped\n", q, p);
+            continue;
+        }
+        for (int r = 0; r < 0x200; r += 8)
+            if (page_is_mapped((char*)p + r))
+                wieen_log("wieen: [L+%02x]+%03x = %#llx\n", q, r,
+                          *(unsigned long long*)((char*)p + r));
+    }
+    char* ci = *(char**)((char*)L + LSTATE_CI);
+    for (int k = 0; k < 6 && ci && page_is_mapped(ci); k++, ci -= 0x30)
+    {
+        char* tv = *(char**)(ci + 8);
+        wieen_log("wieen: frame %d ci %p tv %p\n", k, ci, tv);
+        if (!tv || !page_is_mapped(tv))
+            continue;
+        void* cl = *(void**)tv;
+        if (!cl || !page_is_mapped(cl))
+            continue;
+        void* env = *(void**)((char*)cl + 0x18);
+        wieen_log("wieen:   closure %p env %p\n", cl, env);
+        if (env && page_is_mapped(env))
+            for (int r = 0x60; r < 0x1a0; r += 8)
+                if (page_is_mapped((char*)env + r))
+                    wieen_log("wieen:   env+%03x = %#llx\n", r,
+                              *(unsigned long long*)((char*)env + r));
+    }
+}
 
 /*
  * The state of the game and the callback that is put into it.  The
@@ -702,13 +799,33 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             }
             if (caps64 && tcaps && *tcaps)
             {
-                savedcaps64 = *caps64;
-                *caps64 = strtoull(tcaps, 0, 0);
-                lent64 = 1;
-                wieen_log("wieen: the caps of the sandbox are lent as %#llx "
-                          "(was %#llx)\n", *caps64, savedcaps64);
+                /*
+                 * A field that holds a pointer is not a mask: writing ones
+                 * there would make the game jump into 0xffffffffffffffff.
+                 * Masks of this client are 64-bit values, so anything above
+                 * 48 bits of magnitude is left alone.
+                 */
+                int looks_like_pointer =
+                    (*caps64 >= 0x7F0000000000ULL && *caps64 < 0x800000000000ULL) ||
+                    (*caps64 >= 0x550000000000ULL && *caps64 < 0x570000000000ULL);
+                if (looks_like_pointer)
+                    wieen_log("wieen: the field at %#lx looks like a pointer "
+                              "(%#llx), left alone\n", capsoff, *caps64);
+                else
+                {
+                    savedcaps64 = *caps64;
+                    *caps64 = strtoull(tcaps, 0, 0);
+                    lent64 = 1;
+                    wieen_log("wieen: the caps of the sandbox are lent as "
+                              "%#llx (was %#llx)\n", *caps64, savedcaps64);
+                }
             }
 
+            if (take_flag_file("flag.dump"))
+            {
+                wieen_log("wieen: the dump of the state is asked for\n");
+                dump_state_fields(parent);
+            }
             if (env_flag("WIEEN_DUMPSTATE"))
             {
                 for (int q = 0; q < 0x60; q += 8)
@@ -751,6 +868,7 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             void* env = (closure && is_mapped(closure))
                             ? *(void**)((char*)closure + 0x18)
                             : 0;
+
             void** penv = (env && is_mapped((char*)env + 0x70))
                               ? (void**)((char*)env + 0x70)
                               : 0;
@@ -776,32 +894,95 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                           "(was %p)\n", g_env_mask, savedenv);
             }
 
+            /*
+             * The environment carries a second mask: the check behind
+             * "The current thread cannot access 'X'" reads [env+0x190]
+             * (see 0x22ea744), while the getter/setter path asks the
+             * accessor 0x22ea488 for [env+0x70] & [[L+0x20]+0x80].  Both
+             * are lent here, the pointer is given back afterwards.
+             */
+            unsigned long long* penv190 = 0;
+            unsigned long long saved190 = 0;
+            int lent190 = 0;
+            if (env && page_is_mapped((char*)env + 0x190))
+            {
+                penv190 = (unsigned long long*)((char*)env + 0x190);
+                if (*penv190 < 0x1000000000000ULL)
+                {
+                    saved190 = *penv190;
+                    *penv190 = ~0ULL;
+                    lent190 = 1;
+                    wieen_log("wieen: the mask of the env at +0x190 is lent "
+                              "as %#llx (was %#llx)\n", *penv190, saved190);
+                }
+                else
+                    wieen_log("wieen: the field env+0x190 is %#llx, not a "
+                              "mask, left alone\n", *penv190);
+            }
+
             unsigned long long* pchk = 0;
             unsigned long long savedchk = 0;
+            /*
+             * The checker singletons are global: they cache the allowed
+             * mask of the thread that asked first (+0x30) and reuse it
+             * until the lazy callback at +0x38 is set.  A script of the
+             * game has already filled that cache with its own, smaller
+             * set, so our call would be judged by it.  The cache is lent
+             * the full set for the call and given back afterwards; an
+             * empty WIEEN_CHECKERCAPS turns the lend off.
+             */
+            void* chkobj = 0;
             const char* ckcaps = getenv("WIEEN_CHECKERCAPS");
-            if (ckcaps && *ckcaps)
+            if (!ckcaps || *ckcaps != '0' || ckcaps[1])
             {
                 typedef void* (*fn_single)(void*, int);
                 fn_single single = (fn_single)(g_base + 0x2992ee0UL);
                 void* chk = single((void*)(g_base + 0x6f85d50UL), 0);
+                chkobj = chk;
                 if (chk && is_mapped((char*)chk + 0x38))
                 {
                     pchk = (unsigned long long*)((char*)chk + 0x30);
                     savedchk = *pchk;
-                    *pchk = strtoull(ckcaps, 0, 0);
-                    *(void**)((char*)chk + 0x38) = 0;
+                    *pchk = (ckcaps && *ckcaps && strcmp(ckcaps, "0") != 0)
+                                ? strtoull(ckcaps, 0, 0)
+                                : ~0ULL;
                     wieen_log("wieen: the caps of the checker are lent as "
                               "%#llx (was %#llx)\n", *pchk, savedchk);
                 }
             }
 
+            pthread_t guard;
+            int guarding = 0;
+            const char* guardenv = getenv("WIEEN_GUARD");
+            if (pchk && (!guardenv || strcmp(guardenv, "0") != 0))
+            {
+                g_guard_at = pchk;
+                g_guard_mask = *pchk;
+                g_guard_lazy = chkobj ? (char*)chkobj + 0x38 : 0;
+                g_guard_lazy_val = 0;
+                g_guard_on = 1;
+                guarding = pthread_create(&guard, 0, guard_loop, 0) == 0;
+                if (guarding)
+                    wieen_log("wieen: the guard holds the checker\n");
+            }
             int rc = wieen_pcall(parent, 0, 1, 0);
+            if (guarding)
+            {
+                g_guard_on = 0;
+                pthread_join(guard, 0);
+            }
 
             if (pchk)
             {
                 *pchk = savedchk;
                 wieen_log("wieen: the caps of the checker are %#llx again\n",
                           savedchk);
+            }
+            if (lent190)
+            {
+                *penv190 = saved190;
+                wieen_log("wieen: the mask of the env at +0x190 is %#llx "
+                          "again\n", saved190);
             }
             if (lenved)
             {
@@ -823,12 +1004,6 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             }
             wieen_log("wieen: lua_pcall returned %d, the stack of the game: "
                       "base %p top %p\n", rc, (void*)*pbase, (void*)*ptop);
-            for (int k = 1; k <= 3; k++)
-            {
-                char* v = *ptop - 16 * k;
-                wieen_log("wieen:   the value at -%d: %p tag %d\n", k, v,
-                          is_mapped(v) ? *(int*)(v + 12) : -1);
-            }
             status = rc;
             if (rc != 0)
             {
@@ -1682,7 +1857,11 @@ static unsigned char* scan_region(unsigned long lo, unsigned long hi,
                     continue;
                 if (!found)
                     found = (unsigned char*)g;
-                if (g_candidate_count < MAX_CANDIDATES)
+                int known = 0;
+                for (int i = 0; i < g_candidate_count; i++)
+                    if (g_candidates[i] == (unsigned char*)g)
+                        known = 1;
+                if (!known && g_candidate_count < MAX_CANDIDATES)
                     g_candidates[g_candidate_count++] = (unsigned char*)g;
             }
         }
@@ -1780,12 +1959,53 @@ static int install_preresume(unsigned char* g)
 /*
  * The client holds several Luau VMs, each with its own global state, and
  * only one of them belongs to the game.  A VM that never resumes anything
- * is not the one we are after; a VM that does is asked what it can see.
+ * is not the one we are after; a VM that does is asked who it is.  The
+ * answer is the name of its DataModel: the app of the client calls itself
+ * "LuaApp", the experience the player is in does not.
  */
+static int g_want_experience; /* the app is in use, the experience is awaited */
+
+/* Hooks a candidate, waits for it to resume, and asks the probe who it is.
+ * The answer is written to `out`; 1 means the VM resumed something. */
+static int probe_candidate(unsigned char* g, long wait_ms, char* out,
+                           size_t cap)
+{
+    install_preresume(g);
+    long steps = wait_ms / 100;
+    if (steps < 1)
+        steps = 1;
+    unsigned long before = g_preresume_hits;
+    for (long t = 0; t < steps && g_preresume_hits == before; t++)
+        usleep(100000);
+    if (g_preresume_hits == before)
+    {
+        snprintf(out, cap, "(it does not resume anything)");
+        return 0;
+    }
+    g_probe_wanted = 1;
+    g_probe_done = 0;
+    for (long t = 0; t < steps && !g_probe_done; t++)
+        usleep(100000);
+    snprintf(out, cap, "%s", g_probe_result);
+    return 1;
+}
+
+/* 1 when the answer of the probe names an experience, 0 when it is the app
+ * or an error. */
+static int is_experience(const char* name)
+{
+    return name[0] && strcmp(name, "LuaApp") != 0 &&
+           strncmp(name, "wieen", 5) != 0 && name[0] != '(';
+}
+
+static void* selector_thread(void* arg);
+static void* watcher_thread(void* arg);
+
 static void* selector_thread(void* arg)
 {
     (void)arg;
     unsigned char* live = 0;
+    unsigned char* app = 0;
     for (int round = 0; round < 30 && !g_global_state; round++)
     {
         if (!g_candidate_count && !find_global_state())
@@ -1800,29 +2020,23 @@ static void* selector_thread(void* arg)
         {
             if (g_global_state)
                 break;
-            install_preresume(g_candidates[i]);
-            unsigned long before = g_preresume_hits;
-            for (int t = 0; t < 50 && g_preresume_hits == before; t++)
-                usleep(100000);
-            if (g_preresume_hits == before)
+            char name[160];
+            if (!probe_candidate(g_candidates[i], 5000, name, sizeof(name)))
             {
                 wieen_log("wieen: the VM at %p does not resume anything\n",
                           g_candidates[i]);
                 continue;
             }
+            wieen_log("wieen: the VM at %p says %s\n", g_candidates[i], name);
             if (!live)
                 live = g_candidates[i];
-            g_probe_wanted = 1;
-            g_probe_done = 0;
-            for (int t = 0; t < 50 && !g_probe_done; t++)
-                usleep(100000);
-            wieen_log("wieen: the VM at %p says %s\n", g_candidates[i],
-                      g_probe_result);
-            if (strstr(g_probe_result, "Instance"))
+            if (strcmp(name, "LuaApp") == 0)
+                app = g_candidates[i];
+            if (is_experience(name))
             {
                 g_global_state = g_candidates[i];
-                wieen_log("wieen: the state of the game is %p\n",
-                          g_global_state);
+                wieen_log("wieen: the state of the game is %p (%s)\n",
+                          g_global_state, name);
                 if (env_flag("WIEEN_RICHCAPS"))
                     collect_capabilities(g_candidates[i]);
                 return 0;
@@ -1831,16 +2045,76 @@ static void* selector_thread(void* arg)
         }
         if (live && !g_global_state)
         {
-            /* None of the VMs answered the probe, so the one that runs is
-             * taken: it is the only one that resumes anything. */
+            /* None of the VMs is an experience, so the one that runs is
+             * taken: it is the only one that resumes anything.  The VM of
+             * the experience may appear later, when the player joins a
+             * game; a watcher looks for it and moves the hook there. */
             install_preresume(live);
             g_global_state = live;
-            wieen_log("wieen: the state in use is %p\n", g_global_state);
+            if (app == live)
+            {
+                g_want_experience = 1;
+                pthread_t thread;
+                if (pthread_create(&thread, 0, watcher_thread, 0) == 0)
+                    pthread_detach(thread);
+                wieen_log("wieen: only the app is here, the state in use is "
+                          "%p; waiting for the experience\n", g_global_state);
+            }
+            else
+                wieen_log("wieen: the state in use is %p\n", g_global_state);
             return 0;
         }
         usleep(500000);
     }
     wieen_log("wieen: no state of the game was found\n");
+    return 0;
+}
+
+/*
+ * The player can join an experience after the client has started, and the
+ * DataModel of it comes with a Luau VM of its own.  This keeps looking for
+ * new global states while the app VM is in use, asks each of them who it
+ * is, and moves the hook when the experience shows up.
+ */
+static void* watcher_thread(void* arg)
+{
+    (void)arg;
+    while (g_want_experience)
+    {
+        usleep(3000000);
+        if (!g_want_experience)
+            break;
+        /* a script of ours may be in flight: it must not be disturbed */
+        if (__atomic_load_n(&g_exec_active, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&g_pending_ready, __ATOMIC_RELAXED))
+            continue;
+        int before = g_candidate_count;
+        find_global_state();
+        if (g_candidate_count == before)
+            continue;
+        wieen_log("wieen: %d more Luau states appeared\n",
+                  g_candidate_count - before);
+        unsigned char* chosen = 0;
+        for (int i = before; i < g_candidate_count && !chosen; i++)
+        {
+            char name[160];
+            if (!probe_candidate(g_candidates[i], 5000, name, sizeof(name)))
+                continue;
+            wieen_log("wieen: the VM at %p says %s\n", g_candidates[i], name);
+            if (is_experience(name))
+                chosen = g_candidates[i];
+        }
+        if (chosen)
+        {
+            install_preresume(chosen);
+            g_global_state = chosen;
+            g_want_experience = 0;
+            wieen_log("wieen: the VM of the experience is %p, the scripts "
+                      "run there now\n", chosen);
+        }
+        else
+            install_preresume(g_global_state);
+    }
     return 0;
 }
 
@@ -2370,6 +2644,7 @@ static void serve(int fd)
         pthread_mutex_lock(&g_lock);
         g_pending_len = len;
         g_pending_ready = 1;
+        __atomic_store_n(&g_exec_active, 1, __ATOMIC_RELEASE);
         pthread_cond_broadcast(&g_done);
         pthread_mutex_unlock(&g_lock);
         /* wait for the game to run it */
@@ -2396,6 +2671,7 @@ static void serve(int fd)
             g_result_len = strlen(g_result);
         }
         uint32_t outlen = (uint32_t)g_result_len;
+        __atomic_store_n(&g_exec_active, 0, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&g_lock);
 
         if (write_exact(fd, &outlen, sizeof(outlen)) != 0)

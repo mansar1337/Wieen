@@ -132,7 +132,9 @@ python3 tools/soak.py 60            # ждём 6 из 6 и «client is still the
 | `WIEEN_ENVLOG=1` | печатать `closure`, `env`, указатель маски чанка |
 | `WIEEN_THREADCAPS=<маска>`, `WIEEN_THREADCAPSFILE=<файл>` | подменить маску потока `[[L+0x20]+0x80]` на время вызова |
 | `WIEEN_CHECKERLOG=1` | дамп синглтона-checker прав (`base+0x6f85d50|1`, поля `+0x00..+0x78`) |
-| `WIEEN_CHECKERCAPS=<маска>` | подменить `checker+0x30` (проверено: на доступ не влияет) |
+| `WIEEN_CHECKERCAPS=<маска>` | какую маску держать в `checker+0x30` (по умолчанию полная); сторож удерживает именно её |
+| `WIEEN_GUARD=0` | выключить сторожа: на время вызова он держит `checker+0x30` и обнуляет `checker+0x38`. Включён по умолчанию — без него скрипты игры переписывают кэш checker'а и запись свойств проходит через раз |
+| `WIEEN_CAPSCAN=1` | перечислить состояния VM `global_State` и их маски прав |
 | `WIEEN_FRAMELOG=1` | кадры стека в момент `preresume` |
 | `WIEEN_DUMPSTATE=1` | полный дамп полей `lua_State` |
 | `WIEEN_ALTPCALL=<смещение>` | `luaD_pcall`, которым пользоваться (по умолчанию `0x22e5729`) |
