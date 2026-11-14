@@ -687,12 +687,15 @@ h.WalkSpeed = 0        -- 0, 16, 50, 0, 24, 30, 0 — семь из семи
 Два канала, оба штатные для клиента:
 
 ```lua
+local LOGO = "rbxassetid://96134879839401"
+
 local sg = game:GetService("StarterGui")
-sg:SetCore("SendNotification", {
-    Title = "Wieen injected!",
-    Text = "pwned by wieen! t.me/WieenExploit",
-    Duration = 10,
-})
+local opt = {}
+opt.Title = "Wieen injected!"
+opt.Text = "pwned by wieen! t.me/WieenExploit"
+opt.Duration = 10
+opt.Icon = LOGO
+sg:SetCore("SendNotification", opt)
 print("pwned by wieen! t.me/WieenExploit")
 ```
 
@@ -701,6 +704,12 @@ print("pwned by wieen! t.me/WieenExploit")
 * `print` попадает в консоль F9 как `FLog::CreatorOutput`
   (в `sober_logs/latest.log` это видно строкой
   `Info [FLog::CreatorOutput] pwned by wieen! ...`).
+* `Icon` — это `rbxassetid`, а не путь в файловой системе: картинку
+  клиент берёт только из CDN Roblox. Логотип `docs/logo.png` (928×928)
+  один раз залит в аккаунт как Image `96134879839401` (модерация
+  пройдена, `thumbnails.roblox.com` отдаёт `Completed`), и его id стоит
+  в `LOGO`. Если строку `LOGO` сделать пустой, уведомление уйдёт без
+  картинки, но с заголовком и текстом.
 
 Свой ScreenGui больше не нужен и из скрипта удалён: уведомление рисует
 сам клиент.
@@ -727,3 +736,41 @@ print("pwned by wieen! t.me/WieenExploit")
 Проверено на живом клиенте (place 134720269349402): в логе агента
 `wieen: the greeting, try 1: ok`, в логе клиента — строка `pwned by
 wieen! t.me/WieenExploit`.
+
+---
+
+## 15. Образ клиента появляется позже, чем кажется
+
+Агент ищет образ клиента в своём процессе и ждёт его ограниченное время.
+Сначала это была минута — и один запуск показал, почему этого мало:
+
+```
+info: app: lifecycle: fs_init delta=61348.02886799723ms
+```
+
+Sober поднимает файловую систему клиента **61 секунду**, и только после
+этого `libroblox.so` попадает в процесс. Минута ожидания кончалась за
+секунду до этого, агент писал `no client image in this process, nothing to
+do` — и в игре не было ни уведомления, ни сокета.
+
+Теперь ожидание — десять минут, с отметкой в логе раз в минуту:
+
+```
+wieen: no client image yet, 60 s
+```
+
+Вторая ловушка того же места: `find_client_base` берёт самый большой
+исполняемый ELF-образ, а в процессе их может быть несколько. Если в
+выбранном образе нет ни одной сигнатуры Luau (в логе это
+`has no Luau in it`), агент больше не сдаётся: он запоминает этот образ в
+`g_reject` и ищет дальше, до четырёх отводов и двадцати кругов с паузой в
+секунду. Раньше один неверный выбор навсегда выключал агента в процессе.
+
+В логе теперь виден и путь образа:
+
+```
+wieen: image of the client at 0x7f8e1d11b000, hash 18d8af04a276288d (/home/.../libroblox.so)
+```
+
+Проверка: запуск, где `fs_init` занял 61 с, доводит агента до
+`listening on .../wieen.sock` и до приветствия в игре.

@@ -337,6 +337,13 @@ static void dump_state_fields(void* L)
  * the integrity of the code does not see it.
  */
 static void* g_global_state;         /* the state of the VM we settled on */
+/* The image the client turned out to be, and the images that looked large
+ * enough but had none of the code of Luau in them.  A process can map more
+ * than one such library, and the biggest one is not always the client, so
+ * a wrong pick is remembered and the search goes on. */
+static char g_base_path[512];
+static unsigned long g_reject[4];
+static int g_reject_count;
 static unsigned char* g_installed_g;  /* where our callback is installed */
 static void* g_installed_original;    /* the callback that was there */
 static unsigned long g_preresume_hits;
@@ -2498,6 +2505,14 @@ static int executable_mappings_of(unsigned long base, unsigned long* lo,
  * The second test is what keeps the agent from latching onto an unrelated
  * large library after the client moves.
  */
+static int image_is_rejected(unsigned long base)
+{
+    for (int i = 0; i < g_reject_count; i++)
+        if (g_reject[i] == base)
+            return 1;
+    return 0;
+}
+
 static unsigned long find_client_base(void)
 {
     FILE* f = fopen("/proc/self/maps", "r");
@@ -2506,14 +2521,21 @@ static unsigned long find_client_base(void)
     char line[1024];
     unsigned long candidate[8];
     unsigned long size[8];
+    char path_of[8][512];
     int count = 0;
     while (fgets(line, sizeof(line), f))
     {
-        unsigned long lo, hi, off;
-        char perms[8], path[256];
+        unsigned long lo, hi, off, inode;
+        char perms[8], dev[32], path[256];
         path[0] = 0;
-        if (sscanf(line, "%lx-%lx %7s %lx %255s", &lo, &hi, perms, &off, path) < 4)
+        /* "address perms offset dev inode pathname": the path is the sixth
+           field, and the device and the inode are not it */
+        int fields = sscanf(line, "%lx-%lx %7s %lx %31s %lu %255[^\n]",
+                            &lo, &hi, perms, &off, dev, &inode, path);
+        if (fields < 5)
             continue;
+        if (fields < 6)
+            path[0] = 0;
         if (perms[2] != 'x')
             continue;
         if (hi - lo < 0x4000000)
@@ -2523,8 +2545,13 @@ static unsigned long find_client_base(void)
             continue;
         if (count == (int)(sizeof(candidate) / sizeof(candidate[0])))
             continue;
+        if (image_is_rejected(base))
+            continue;
         candidate[count] = base;
         size[count] = hi - lo;
+        path_of[count][0] = 0;
+        if (path[0])
+            snprintf(path_of[count], sizeof(path_of[count]), "%.*s", 255, path);
         count++;
     }
     fclose(f);
@@ -2538,7 +2565,10 @@ static unsigned long find_client_base(void)
         if (at + sizeof(SIG_RESUME) > candidate[i] + size[i])
             continue; /* the offset falls outside of this image */
         if (memcmp((void*)at, SIG_RESUME, sizeof(SIG_RESUME)) == 0)
+        {
+            snprintf(g_base_path, sizeof(g_base_path), "%.*s", 511, path_of[i]);
             return candidate[i];
+        }
     }
 
     /* otherwise the biggest one, which is what the client always is */
@@ -2549,6 +2579,7 @@ static unsigned long find_client_base(void)
     if (count > 1)
         wieen_log("wieen: %d candidate images, picked the largest at %p\n", count,
                   (void*)candidate[pick]);
+    snprintf(g_base_path, sizeof(g_base_path), "%.*s", 511, path_of[pick]);
     return candidate[pick];
 }
 
@@ -2815,11 +2846,22 @@ static void* server_thread(void* arg)
 static void* setup_thread(void* arg)
 {
     (void)arg;
-    for (int tries = 0; tries < 600; tries++)
+    /*
+     * The client is loaded into the process after its file system is set
+     * up, and that can take a minute of its own, so the image is waited
+     * for ten minutes and not one: a miss here means the agent is not in
+     * the process at all.
+     */
+    int rounds = 0;
+retry:
+    g_base = 0;
+    for (int tries = 0; tries < 6000; tries++)
     {
         g_base = find_client_base();
         if (g_base)
             break;
+        if ((tries % 600) == 599)
+            wieen_log("wieen: no client image yet, %d s\n", (tries + 1) / 10);
         usleep(100000);
     }
     if (!g_base)
@@ -2838,8 +2880,8 @@ static void* setup_thread(void* arg)
     refresh_maps();
 
     unsigned long long hash = hash_image(g_base, 16 * 1024 * 1024);
-    wieen_log("wieen: image of the client at %p, hash %016llx\n", (void*)g_base,
-              hash);
+    wieen_log("wieen: image of the client at %p, hash %016llx (%s)\n",
+              (void*)g_base, hash, g_base_path[0] ? g_base_path : "?");
     if (hash != WIEEN_KNOWN_HASH)
         wieen_log("wieen: this is not the build the tables were made for "
                   "(known %016llx), falling back to the signatures\n",
@@ -2848,7 +2890,7 @@ static void* setup_thread(void* arg)
     if (!find_text_ranges())
     {
         wieen_log("wieen: no executable mapping in the image of the client\n");
-        return 0;
+        goto reject_image;
     }
 
     /*
@@ -3006,7 +3048,7 @@ static void* setup_thread(void* arg)
                   "lua_tolstring=%d lua_newthread=%d\n",
                   g_resume_addr != 0, g_load != 0, g_tolstring != 0,
                   g_newthread != 0);
-        return 0;
+        goto reject_image;
     }
 
     /*
@@ -3023,6 +3065,31 @@ static void* setup_thread(void* arg)
         pthread_detach(thread);
     if (pthread_create(&thread, 0, selector_thread, 0) == 0)
         pthread_detach(thread);
+    return 0;
+
+reject_image:
+    /*
+     * The image looks like a client but none of the code of Luau is in
+     * it: another library of the process was picked, and the client itself
+     * is either not mapped yet or is mapped elsewhere.  The pick is
+     * remembered so that the same image is not taken again.
+     */
+    wieen_log("wieen: %s has no Luau in it, looking for another image\n",
+              g_base_path[0] ? g_base_path : "(unknown)");
+    g_resume_addr = 0;
+    g_load = 0;
+    g_tolstring = 0;
+    g_newthread = 0;
+    g_pcall = 0;
+    g_dcall = 0;
+    if (rounds++ < 20 && g_reject_count < 4)
+    {
+        g_reject[g_reject_count++] = (unsigned long)g_base;
+        g_base = 0;
+        usleep(1000000);
+        goto retry;
+    }
+    wieen_log("wieen: no image of the client with the code of Luau in it\n");
     return 0;
 }
 
