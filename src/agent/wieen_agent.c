@@ -58,6 +58,7 @@
 typedef int (*fn_load)(void* L, const char* chunkname, const char* data,
                         unsigned long size, int env);
 typedef int (*fn_resume)(void* L, void* from, int nargs);
+typedef int (*fn_pcall)(void* L, int nargs, int nresults, int errfunc);
 typedef void* (*fn_newthread)(void* L);
 typedef const char* (*fn_tolstring)(void* L, int idx, unsigned long* len);
 
@@ -116,6 +117,7 @@ static const struct signature SIGNATURES[] = {
 #define WIEEN_KNOWN_HASH 0x18d8af04a276288dULL
 
 static fn_load g_load;
+static fn_pcall g_pcall;
 static fn_resume g_resume;
 static fn_newthread g_newthread;
 static fn_tolstring g_tolstring;
@@ -219,6 +221,9 @@ static int g_in_preresume;            /* a script of ours is running */
 static int g_probe_wanted;            /* the next hit has to be probed */
 static int g_probe_done;
 static char g_probe_result[160];
+
+/* the masks of the capabilities of the states of the VM */
+#define CAP_MASKS 32
 
 /*
  * The search for the state of the VM reads the memory of the client, and
@@ -401,6 +406,8 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
     /* The thread object on the parent stack roots our coroutine against GC. */
     int status = -1;
     int loadstatus = -1;
+    ptrdiff_t savedoffset = 0;
+    char* savedtop = 0;
     wieen_log("wieen: running a script after %lu resumes of the game\n",
               g_preresume_hits);
     wieen_log("wieen: creating thread for %lu bytes in parent %p\n",
@@ -450,6 +457,18 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             *(unsigned int*)((const unsigned char*)parent + LSTATE_CAPS);
         *(unsigned int*)((unsigned char*)thread + LSTATE_CAPS) = caps;
         wieen_log("wieen: the capabilities of the thread are %#x\n", caps);
+
+        const char* copy = getenv("WIEEN_COPYOFF");
+        if (copy && *copy)
+        {
+            /* a field of the thread of the game: the sandbox, the context
+             * and the rights of a script live in one of them */
+            unsigned long off = strtoul(copy, 0, 0);
+            *(unsigned long*)((char*)thread + off) =
+                *(unsigned long*)((char*)parent + off);
+            wieen_log("wieen: the field +%#lx is copied: %p\n", off,
+                      *(void**)((char*)thread + off));
+        }
     }
 
     if (thread && env_flag("WIEEN_CAPSCAN"))
@@ -483,18 +502,35 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
     }
     else
     {
-        status = g_load(thread, "=wieen", (const char*)chunk, bclen, 0);
+        /*
+         * The script can run in the thread of the game itself: then it has
+         * the sandbox and the context of the game, and its print goes to
+         * the console of the game and not only to the log.
+         */
+        int inthread = env_flag("WIEEN_INTHREAD") && g_pcall != 0;
+        void* rt = inthread ? parent : thread;
+        if (inthread)
+        {
+            char** top = (char**)((char*)parent + LSTATE_TOP);
+            char** stack = (char**)((char*)parent + LSTATE_STACK);
+            savedtop = *top;
+            savedoffset = savedtop - *stack;
+            wieen_log("wieen: the script runs in the thread of the game %p\n",
+                      parent);
+        }
+
+        status = g_load(rt, "=wieen", (const char*)chunk, bclen, 0);
         loadstatus = status;
         wieen_log("wieen: luau_load returned %d\n", status);
         if (status != 0)
         {
             /* The compiler left its complaint on the stack: read it. */
             size_t errlen = 0;
-            const char* err = g_tolstring(thread, -1, &errlen);
+            const char* err = g_tolstring(rt, -1, &errlen);
             wieen_log("wieen: the compiler says: %s\n",
                       err ? err : "(nothing on the stack)");
         }
-        char* top = *(char**)((char*)thread + LSTATE_TOP);
+        char* top = *(char**)((char*)rt + LSTATE_TOP);
         wieen_log("wieen: loaded %lu bytes, the function is at %p\n",
                   (unsigned long)bclen, top - 16);
         if (status == 0 && env_flag("WIEEN_NORESUME"))
@@ -502,6 +538,38 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             wieen_log("wieen: resume disabled by WIEEN_NORESUME\n");
             *message = "thread created and chunk loaded; resume skipped";
             *messagelen = strlen(*message);
+        }
+        else if (status == 0 && inthread)
+        {
+            /*
+             * The function is on the stack of the thread of the game, so it
+             * is called right there: the script runs with the sandbox of
+             * the game.
+             */
+            char** ptop = (char**)((char*)parent + LSTATE_TOP);
+            char** pbase = (char**)((char*)parent + LSTATE_BASE);
+            wieen_log("wieen: the stack of the game: base %p top %p\n",
+                      (void*)*pbase, (void*)*ptop);
+            int rc = g_pcall(parent, 0, 1, 0);
+            wieen_log("wieen: lua_pcall returned %d, the stack of the game: "
+                      "base %p top %p\n", rc, (void*)*pbase, (void*)*ptop);
+            for (int k = 1; k <= 3; k++)
+            {
+                char* v = *ptop - 16 * k;
+                wieen_log("wieen:   the value at -%d: %p tag %d\n", k, v,
+                          is_mapped(v) ? *(int*)(v + 12) : -1);
+            }
+            status = rc;
+            if (rc != 0)
+            {
+                *message = "the script failed in the thread of the game";
+                *messagelen = strlen(*message);
+                status = -1;
+            }
+            else
+            {
+                status = 0;
+            }
         }
         else if (status == 0)
         {
@@ -550,7 +618,10 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
         }
         wieen_log("wieen: reading result\n");
         size_t resultlen = 0;
-        *message = g_tolstring(thread, -1, &resultlen);
+        int index = -1;
+        if (status == 0 && env_flag("WIEEN_INTHREAD") && g_pcall != 0)
+            index = -2;  /* the result is under the top of the stack */
+        *message = g_tolstring(rt, index, &resultlen);
         *messagelen = resultlen;
         if (!*message)
         {
@@ -558,7 +629,9 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
              * lua_tolstring only knows strings and numbers; for the
              * other types the tag of the value is read from the stack.
              */
-            char* top = *(char**)((char*)thread + LSTATE_TOP);
+            char* top = *(char**)((char*)rt + LSTATE_TOP);
+            if (index == -2)
+                top -= 16;
             if (is_mapped(top) && is_mapped(top - 16))
             {
                 char* value = top - 16;
@@ -588,6 +661,15 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                 *messagelen = strlen(*message);
             }
         }
+    }
+
+    if (env_flag("WIEEN_INTHREAD") && g_pcall != 0)
+    {
+        /* the stack of the thread of the game is put back as it was */
+        char** stack = (char**)((char*)parent + LSTATE_STACK);
+        char** top = (char**)((char*)parent + LSTATE_TOP);
+        *top = *stack + savedoffset;
+        wieen_log("wieen: the stack of the thread of the game is restored\n");
     }
 
     if (status == 1 && loadstatus == 0)
@@ -1833,6 +1915,21 @@ static void* setup_thread(void* arg)
             g_tolstring = (fn_tolstring)at;
         else
             g_newthread = (fn_newthread)at;
+    }
+
+    /*
+     * The call of a function of Luau: the agent runs the script in the
+     * thread of the game, so it needs lua_pcall of the same copy of the
+     * VM.  The offset can be given by hand:
+     * WIEEN_ALTPCALL=<offset of lua_pcall in the image>.
+     */
+    const char* altpcall = getenv("WIEEN_ALTPCALL");
+    if (altpcall && *altpcall)
+    {
+        unsigned long off = strtoul(altpcall, 0, 0);
+        g_pcall = (fn_pcall)((unsigned char*)g_base + off);
+        wieen_log("wieen: lua_pcall is taken from %p (offset %#lx)\n",
+                  (void*)g_pcall, off);
     }
 
     /*
