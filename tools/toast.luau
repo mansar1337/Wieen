@@ -21,11 +21,19 @@ if not pg then
     return "wait-gui"
 end
 
+-- The logo of the notification is an image of Roblox, so it has to be
+-- uploaded once and referenced by its id: "rbxassetid://<id>".  While the
+-- string is empty the notification goes without it.
+local LOGO = "rbxassetid://96134879839401"
+
 local sg = game:GetService("StarterGui")
 local opt = {}
 opt.Title = "Wieen injected!"
 opt.Text = "pwned by wieen! t.me/WieenExploit"
 opt.Duration = 10
+if LOGO ~= "" then
+    opt.Icon = LOGO
+end
 local ok = pcall(sg.SetCore, sg, "SendNotification", opt)
 if not ok then
     return "wait"
