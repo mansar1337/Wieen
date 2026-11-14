@@ -222,6 +222,9 @@ static int g_probe_wanted;            /* the next hit has to be probed */
 static int g_probe_done;
 static char g_probe_result[160];
 
+/* the union of the sets of the capabilities of the states of the VM */
+static unsigned int g_rich_caps;
+
 /* the masks of the capabilities of the states of the VM */
 #define CAP_MASKS 32
 
@@ -455,6 +458,8 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
          */
         unsigned int caps =
             *(unsigned int*)((const unsigned char*)parent + LSTATE_CAPS);
+        if (env_flag("WIEEN_RICHCAPS"))
+            caps |= g_rich_caps;
         *(unsigned int*)((unsigned char*)thread + LSTATE_CAPS) = caps;
         wieen_log("wieen: the capabilities of the thread are %#x\n", caps);
 
@@ -875,6 +880,84 @@ static void run_probe(void* L)
  * client does not see it.  It is called from lua_resume on the game thread,
  * which is exactly the context a script needs.
  */
+static void collect_capabilities(unsigned char* g)
+{
+    unsigned int masks[32];
+    int counts[32];
+    int count = 0;
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof(line), f))
+    {
+        unsigned long lo, hi;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3)
+            continue;
+        if (perms[0] != 'r' || perms[1] != 'w')
+            continue;
+        const unsigned long chunk = 64UL << 20;
+        size_t pages = chunk >> 12;
+        unsigned char* vec = malloc(pages);
+        if (!vec)
+            continue;
+        for (unsigned long base = lo; base < hi; base += chunk)
+        {
+            unsigned long len = hi - base < chunk ? hi - base : chunk;
+            if (mincore((void*)base, len, vec) != 0)
+                continue;
+            size_t npages = (len + 0xFFF) >> 12;
+            for (size_t pg = 0; pg < npages; pg++)
+            {
+                if (!(vec[pg] & 1))
+                    continue;
+                unsigned long page = base + (pg << 12);
+                for (unsigned long q = page; q + 8 <= page + 4096; q += 8)
+                {
+                    if (*(unsigned long*)q != (unsigned long)g)
+                        continue;
+                    unsigned long l = q - LSTATE_GLOBAL;
+                    if (!is_mapped((void*)l))
+                        continue;
+                    unsigned int c = *(unsigned int*)((char*)l + LSTATE_CAPS);
+                    unsigned int bits = 0;
+                    for (unsigned int v = c; v; v &= v - 1)
+                        bits++;
+                    if (bits > 12 || c == 0)
+                        continue;
+                    int found = -1;
+                    for (int i = 0; i < count; i++)
+                        if (masks[i] == c)
+                        {
+                            found = i;
+                            break;
+                        }
+                    if (found < 0)
+                    {
+                        if (count >= 32)
+                            continue;
+                        found = count++;
+                        masks[found] = c;
+                        counts[found] = 0;
+                    }
+                    counts[found]++;
+                }
+            }
+        }
+        free(vec);
+    }
+    fclose(f);
+    for (int i = 0; i < count; i++)
+        if (counts[i] >= 2)
+        {
+            g_rich_caps |= masks[i];
+            wieen_log("wieen: the mask %#x is seen in %d states\n", masks[i],
+                      counts[i]);
+        }
+    wieen_log("wieen: the whole set of the capabilities is %#x\n", g_rich_caps);
+}
+
 static void wieen_preresume(void* L)
 {
     if (g_in_preresume)
@@ -1209,6 +1292,8 @@ static void* selector_thread(void* arg)
                 g_global_state = g_candidates[i];
                 wieen_log("wieen: the state of the game is %p\n",
                           g_global_state);
+                if (env_flag("WIEEN_RICHCAPS"))
+                    collect_capabilities(g_candidates[i]);
                 return 0;
             }
             remove_preresume();
