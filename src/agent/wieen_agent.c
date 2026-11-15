@@ -145,6 +145,12 @@ static fn_tolstring g_tolstring;
 static void* g_resume_addr;
 static unsigned long g_base;
 
+/* defined below, used by the loadstring path of the resume loop */
+static int wieen_pcall(void* L, int nargs, int nresults, int errfunc);
+static unsigned long read_u32(const unsigned char* p);
+static int read_exact(int fd, void* buf, size_t len);
+static int write_exact(int fd, const void* buf, size_t len);
+
 /* the offsets of the stack in a lua_State, taken from the client's code */
 /*
  * The layout of the state in this client, taken from the code:
@@ -579,6 +585,99 @@ static void copy_result(char* out, size_t cap, size_t* outlen, const char* text,
  * Runs one chunk of the script in the given state.  The stack of the state
  * is restored afterwards, so the game does not notice that we were here.
  */
+/* a loadstring source that is a link: the host downloads it and compiles */
+static int is_link(const char* src, size_t len)
+{
+    return (len > 7 && memcmp(src, "http://", 7) == 0) ||
+           (len > 8 && memcmp(src, "https://", 8) == 0);
+}
+
+/*
+ * A loadstring source too big for one chunk arrives as a dispatcher and
+ * the functions of its parts.  The dispatcher takes them and returns one
+ * function; the functions are loaded on the stack of the thread, then the
+ * dispatcher is called with them, and the closure it returns is what the
+ * yield of the loadstring sees.
+ */
+static int load_loadstring(void* thread, const unsigned char* data, size_t len,
+                           const char** message, size_t* messagelen)
+{
+    if (len < 12 || memcmp(data, "WIEENLSP", 8) != 0)
+    {
+        *message = "broken loadstring frame";
+        *messagelen = strlen(*message);
+        return -1;
+    }
+
+    size_t off = 8;
+    unsigned long dlen = read_u32(data + off);
+    off += 4;
+    if (!dlen || off + dlen > len)
+    {
+        *message = "broken loadstring dispatcher";
+        *messagelen = strlen(*message);
+        return -1;
+    }
+    if (g_load(thread, "=wieen-ls", (const char*)data + off, dlen, 0) != 0)
+    {
+        *message = "the client could not load the loadstring dispatcher";
+        *messagelen = strlen(*message);
+        return -1;
+    }
+    off += dlen;
+
+    if (off + 4 > len)
+    {
+        *message = "broken loadstring parts";
+        *messagelen = strlen(*message);
+        return -1;
+    }
+    unsigned long count = read_u32(data + off);
+    off += 4;
+    if (!count || count > 512)
+    {
+        *message = "broken loadstring parts";
+        *messagelen = strlen(*message);
+        return -1;
+    }
+
+    for (unsigned long i = 0; i < count; i++)
+    {
+        if (off + 4 > len)
+        {
+            *message = "broken loadstring parts";
+            *messagelen = strlen(*message);
+            return -1;
+        }
+        unsigned long plen = read_u32(data + off);
+        off += 4;
+        if (!plen || off + plen > len)
+        {
+            *message = "broken loadstring parts";
+            *messagelen = strlen(*message);
+            return -1;
+        }
+        if (g_load(thread, "=wieen-ls", (const char*)data + off, plen, 0) != 0)
+        {
+            *message = "the client could not load a part of the loadstring";
+            *messagelen = strlen(*message);
+            return -1;
+        }
+        off += plen;
+    }
+
+    int rc = wieen_pcall(thread, (int)count, 1, 0);
+    if (rc != 0)
+    {
+        unsigned long whylen = 0;
+        const char* why = g_tolstring(thread, -1, &whylen);
+        *message = why ? why : "the loadstring dispatcher failed";
+        *messagelen = why ? whylen : strlen(*message);
+        return -1;
+    }
+    return 0;
+}
+
 static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                    const char** message, size_t* messagelen)
 {
@@ -1152,6 +1251,9 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
              * the end anyway.
              */
             int resumes = 0;
+            /* a loaded chunk is the result of the yield, so the next
+             * resume takes it as an argument */
+            int nargs = 0;
             for (;;)
             {
                 /*
@@ -1160,7 +1262,8 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                  * that recurses deeply must not walk past the stack of the
                  * game.
                  */
-                status = g_resume(thread, parent, 0);
+                status = g_resume(thread, parent, nargs);
+                nargs = 0;
                 if (status != 1)
                     break;
 
@@ -1169,15 +1272,17 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                  * source and waits.  The host compiles it - the client has
                  * no working loadstring - and the result is loaded here.
                  */
-                if (g_compile && g_conn_fd >= 0)
+                size_t srclen = 0;
+                const char* src = g_tolstring(thread, -1, &srclen);
+
+                if (g_compile && g_conn_fd >= 0 && !is_link(src, srclen) &&
+                    !(src && srclen > 3 && memcmp(src, "\1h:", 3) == 0))
                 {
                     /*
                      * The client has its own compiler: the source is
                      * compiled inside it, so the bytecode is in the format
                      * of the client and needs no translation.
                      */
-                    size_t srclen = 0;
-                    const char* src = g_tolstring(thread, -1, &srclen);
                     if (src && srclen && srclen < 65536)
                     {
                         unsigned long outsize = 0;
@@ -1193,9 +1298,7 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                                       "load returned %d\n", st);
                             if (st == 0)
                             {
-                                status = g_resume(thread, parent, 1);
-                                if (status != 1)
-                                    break;
+                                nargs = 1;
                                 continue;
                             }
                             status = -1;
@@ -1208,28 +1311,71 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                     }
                 }
 
-                if (g_conn_fd >= 0)
+                if (g_conn_fd >= 0 && src && srclen && srclen < (8u << 20))
                 {
-                    size_t srclen = 0;
-                    const char* src = g_tolstring(thread, -1, &srclen);
-                    if (src && srclen && srclen < 65536)
                     {
-                        char req[9 + 65536];
-                        memcpy(req, "\x00" "compile:", 9);
-                        memcpy(req + 9, src, srclen);
-                        unsigned int n = (unsigned int)(9 + srclen);
-                        if (write(g_conn_fd, &n, 4) == 4 &&
-                            write(g_conn_fd, req, n) == (ssize_t)n)
+                        /*
+                         * A link is not a source: the host downloads it and
+                         * compiles what came back.  Either way the answer is
+                         * bytecode of a loadstring chunk.  A download of
+                         * game:HttpGet comes as a marker with the address;
+                         * the host answers with a chunk that returns the
+                         * text of the link.
+                         */
+                        int http = srclen > 3 && memcmp(src, "\1h:", 3) == 0;
+                        int link = !http && is_link(src, srclen);
+                        const char* prefix = http ? "\x00" "http:"
+                                                  : link ? "\x00" "fetch:"
+                                                         : "\x00" "compile:";
+                        size_t plen = http ? 6 : link ? 7 : 9;
+                        const char* body = http ? src + 3 : src;
+                        size_t bodylen = srclen - (http ? 3 : 0);
+                        char* req = (char*)malloc(plen + bodylen);
+                        if (!req)
                         {
+                            status = -1;
+                            *message = "no memory for the request to the host";
+                            *messagelen = strlen(*message);
+                            break;
+                        }
+                        memcpy(req, prefix, plen);
+                        memcpy(req + plen, body, bodylen);
+                        unsigned int n = (unsigned int)(plen + bodylen);
+                        if (write_exact(g_conn_fd, &n, 4) == 0 &&
+                            write_exact(g_conn_fd, req, n) == 0)
+                        {
+                            free(req);
                             unsigned int rl = 0;
-                            if (read(g_conn_fd, &rl, 4) == 4 && rl > 10)
+                            if (read_exact(g_conn_fd, &rl, 4) == 0 && rl > 10)
                             {
                                 char* buf = (char*)malloc(rl);
-                                if (buf && read(g_conn_fd, buf, rl) == (ssize_t)rl &&
+                                if (buf && read_exact(g_conn_fd, buf, rl) == 0 &&
                                     memcmp(buf, "\x00" "compiled:", 10) == 0)
                                 {
-                                    int st = g_load(thread, "=wieen", buf + 10,
-                                                    rl - 10, 0);
+                                    size_t blen = rl - 10;
+                                    const unsigned char* body =
+                                        (const unsigned char*)buf + 10;
+                                    if (blen >= 8 &&
+                                        memcmp(body, "WIEENLSP", 8) == 0)
+                                    {
+                                        int ls = load_loadstring(thread, body,
+                                                                 blen, message,
+                                                                 messagelen);
+                                        wieen_log("wieen: the host sent a "
+                                                  "loadstring in parts, "
+                                                  "load returned %d\n", ls);
+                                        free(buf);
+                                        if (ls == 0)
+                                        {
+                                            nargs = 1;
+                                            continue;
+                                        }
+                                        status = -1;
+                                        break;
+                                    }
+                                    int st = g_load(thread, "=wieen",
+                                                    (const char*)body,
+                                                    blen, 0);
                                     wieen_log("wieen: the host compiled the "
                                               "source, %u bytes, load returned "
                                               "%d\n", rl - 10, st);
@@ -1238,9 +1384,7 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                                     {
                                         /* the function is on the stack: it
                                          * is the result of the yield */
-                                        status = g_resume(thread, parent, 1);
-                                        if (status != 1)
-                                            break;
+                                        nargs = 1;
                                         continue;
                                     }
                                     status = -1;
@@ -1252,6 +1396,8 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                                 free(buf);
                             }
                         }
+                        else
+                            free(req);
                     }
                 }
 

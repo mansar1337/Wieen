@@ -22,6 +22,8 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 APP_ID = "org.vinegarhq.Sober"
@@ -131,6 +133,52 @@ end
 """
 
 
+# a loadstring source may be a link: it is downloaded here, because the
+# client has no http client of its own
+FETCH_LIMIT = 1024 * 1024
+_fetch_cache: dict[str, bytes] = {}
+
+
+def fetch_link(url: str) -> bytes:
+    """Download the source of a loadstring from a link."""
+    if url in _fetch_cache:
+        return _fetch_cache[url]
+    request = urllib.request.Request(url, headers={"User-Agent": "wieen"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = response.read(FETCH_LIMIT + 1)
+    if len(data) > FETCH_LIMIT:
+        raise RuntimeError(f"the link is bigger than {FETCH_LIMIT} bytes")
+    if not data.strip():
+        raise RuntimeError("the link is empty")
+    _fetch_cache[url] = data
+    return data
+
+
+def lua_quote(text: str) -> str:
+    """A Lua short string literal for the message."""
+    out = ['"']
+    for ch in text:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ord(ch) < 32 or ord(ch) == 127:
+            out.append("\\%d" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def lua_text_chunk(data: bytes) -> str:
+    """A Lua source whose chunk returns the given bytes as a string."""
+    level = 0
+    while (b"]" + b"=" * level + b"]") in data:
+        level += 1
+    eq = "=" * level
+    return "return [" + eq + "[\n" + data.decode("utf-8", "surrogateescape") + "]" + eq + "]"
+
+
 class Agent:
     """Client for the agent's socket protocol: [u32 len][payload]."""
 
@@ -166,21 +214,34 @@ class Agent:
             buf += chunk
         return buf
 
-    def compile(self, source: str) -> bytes:
+    def compile(self, source: str, loadstring: bool = False) -> bytes:
         """Compile the snippet into Luau bytecode.
 
         The client only ships the Luau VM, not the compiler, so the
         bytecode is produced here and the agent loads it with the
-        client's own luau_load.
+        client's own luau_load.  A loadstring source is a function of its
+        own: it is compiled raw, and when it does not fit into one chunk
+        the compiler returns a dispatcher over the parts.
         """
         if not COMPILER.exists():
             raise FileNotFoundError(f"compiler not built: {COMPILER} (run: make compile)")
-        proc = subprocess.run([str(COMPILER), "-"], input=source.encode(),
+        argv = [str(COMPILER), "-"]
+        if loadstring:
+            argv.append("--loadstring")
+        proc = subprocess.run(argv, input=source.encode("utf-8", "surrogateescape"),
                               capture_output=True)
         if proc.returncode != 0 or not proc.stdout:
             raise RuntimeError(proc.stderr.decode(errors="replace").strip()
                                or "compilation failed")
         return proc.stdout
+
+    def error_chunk(self, message: str) -> bytes:
+        """A chunk that raises the message where the script waits for it."""
+        message = message[:160]
+        try:
+            return self.compile("error(" + lua_quote(message) + ")", loadstring=True)
+        except Exception:
+            return b""
 
     def exec(self, source: str) -> str:
         if self.sock is None and not self.connect():
@@ -193,14 +254,37 @@ class Agent:
         while True:
             (length,) = struct.unpack("<I", self._recv_exact(4))
             data = self._recv_exact(length)
-            if not data.startswith(b"\x00compile:"):
+            if data.startswith(b"\x00http:"):
+                # game:HttpGet was rewritten: the host downloads the text
+                # and sends back a chunk that returns it
+                url = data[len(b"\x00http:"):].decode(errors="replace")
+                try:
+                    text = fetch_link(url)
+                    code = self.compile(lua_text_chunk(text), loadstring=True)
+                except Exception as error:
+                    print(f"wieen: cannot get {url}: {error}", file=sys.stderr)
+                    code = self.error_chunk(f"wieen: cannot get {url}")
+            elif data.startswith(b"\x00fetch:"):
+                # the loadstring was given a link: the source is downloaded
+                # here, then compiled the same way as any other one
+                url = data[len(b"\x00fetch:"):].decode(errors="replace")
+                try:
+                    source_text = fetch_link(url).decode(errors="replace")
+                    code = self.compile(source_text, loadstring=True)
+                except Exception as error:  # the script sees the error
+                    print(f"wieen: cannot load {url}: {error}",
+                          file=sys.stderr)
+                    code = self.error_chunk(f"wieen: cannot load {url}")
+            elif data.startswith(b"\x00compile:"):
+                # the agent wants a chunk compiled; this one is the source
+                # of a loadstring, so it becomes a function of its own
+                source_text = data[len(b"\x00compile:"):].decode(errors="replace")
+                try:
+                    code = self.compile(source_text, loadstring=True)
+                except Exception as error:  # the script sees the error
+                    code = b""
+            else:
                 return data.decode(errors="replace")
-            # the agent wants a chunk compiled
-            source_text = data[len(b"\x00compile:"):].decode(errors="replace")
-            try:
-                code = self.compile(source_text)
-            except Exception as error:  # the script sees the error
-                code = b""
             reply = b"\x00compiled:" + code
             self.sock.sendall(struct.pack("<I", len(reply)) + reply)
 

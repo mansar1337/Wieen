@@ -26,11 +26,14 @@
 #include "Luau/ParseResult.h"
 #include "Luau/Parser.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -250,12 +253,27 @@ bool translate_opcodes(char* bytecode, size_t size, std::string& error)
  */
 static const size_t kPartLimit = 279;
 
+/* defined below: a call of game:HttpGet becomes a call of the host */
+static bool rewrite_httpget(std::string& text);
+
+/*
+ * The function a rewritten call needs.  It is put only into a chunk that
+ * really downloads, so a chunk without HttpGet pays nothing for it.  The
+ * guard keeps one copy for every chunk of a script and for a nested
+ * loadstring.
+ */
+static const char kHttpPrelude[] =
+    "_WH = function(u) return (coroutine.yield(\"\\1h:\" .. u))() end\n";
+
 static bool compile_source(const std::string& source, lua_CompileOptions options,
                            bool keep_upstream, std::string& out, std::string& error)
 {
+    std::string text = source;
+    if (rewrite_httpget(text))
+        text = kHttpPrelude + text;
     size_t size = 0;
     lua_CompileOptions opts = options;
-    char* bytecode = luau_compile(source.data(), source.size(), &opts, &size);
+    char* bytecode = luau_compile(text.data(), text.size(), &opts, &size);
     if (!bytecode || !size)
     {
         error = "compilation failed";
@@ -280,7 +298,7 @@ static bool compile_source(const std::string& source, lua_CompileOptions options
 /* the byte offset of a place of the source */
 static size_t offset_of(const std::string& source, const Luau::Position& position)
 {
-    if (position.line == 0 || position.line == UINT_MAX)
+    if (position.line == UINT_MAX)
         return 0;
     /* the lines of the parser start at zero */
     size_t line = 0;
@@ -347,12 +365,212 @@ static void make_globals(std::string& text, const Luau::ParseResult& result)
 }
 
 /*
+ * The client has no HTTP client (game:HttpGet does not exist there), so a
+ * script that downloads with it would stop at the first call.  The call is
+ * rewritten into one of our own function: it asks the host for the text,
+ * and the host is the only side that has a network.
+ *
+ * The usual shape loadstring(game:HttpGet(url)) is rewritten tighter: the
+ * URL goes straight into loadstring, which already downloads and compiles
+ * a link itself, so the text never travels through the client.
+ */
+struct HttpEdit
+{
+    size_t begin;
+    size_t end;
+    std::string text;
+};
+
+class HttpRewriter : public Luau::AstVisitor
+{
+public:
+    explicit HttpRewriter(const std::string& text)
+        : text(text)
+    {
+    }
+
+    bool visit(Luau::AstExprCall* call) override
+    {
+        /* loadstring(game:HttpGet(url)) -> loadstring(url): the link of a
+         * loadstring is downloaded and compiled by the host as it is */
+        Luau::AstExprGlobal* name = call->func->as<Luau::AstExprGlobal>();
+        if (name && name->name == "loadstring" && call->args.size == 1)
+        {
+            Span inner;
+            if (httpget(call->args.data[0], inner))
+            {
+                edits.push_back({inner.begin, inner.end,
+                                 text.substr(inner.argBegin,
+                                             inner.argEnd - inner.argBegin)});
+                return false;
+            }
+        }
+
+        Span span;
+        if (httpget(call, span))
+        {
+            edits.push_back({span.begin, span.end,
+                             "_WH(" + text.substr(span.argBegin,
+                                                  span.argEnd - span.argBegin) + ")"});
+            return false;
+        }
+        return true;
+    }
+
+    /* the span of the whole game:HttpGet(...) call and the span of its URL */
+    struct Span
+    {
+        size_t begin, end, argBegin, argEnd;
+    };
+
+    bool httpget(Luau::AstExpr* expr, Span& span)
+    {
+        Luau::AstExprCall* call = expr->as<Luau::AstExprCall>();
+        if (!call)
+            return false;
+        Luau::AstExprIndexName* index = call->func->as<Luau::AstExprIndexName>();
+        if (!index)
+            return false;
+        if (index->index != "HttpGet" && index->index != "HttpGetAsync")
+            return false;
+        Luau::AstExprGlobal* base = index->expr->as<Luau::AstExprGlobal>();
+        if (!base || base->name != "game")
+            return false;
+        if (!call->args.size)
+            return false;
+        span.begin = offset_of(text, call->location.begin);
+        span.end = offset_of(text, call->location.end);
+        span.argBegin = offset_of(text, call->args.data[0]->location.begin);
+        span.argEnd =
+            offset_of(text, call->args.data[call->args.size - 1]->location.end);
+        return true;
+    }
+
+    std::vector<HttpEdit> edits;
+
+private:
+    const std::string& text;
+};
+
+static bool rewrite_httpget(std::string& text)
+{
+    if (text.find("HttpGet") == std::string::npos)
+        return false;
+
+    Luau::Allocator allocator;
+    Luau::AstNameTable names(allocator);
+    Luau::ParseOptions parseOptions;
+    Luau::ParseResult result =
+        Luau::Parser::parse(text.data(), text.size(), names, allocator, parseOptions);
+    if (!result.errors.empty() || !result.root)
+        return false;
+
+    HttpRewriter rewriter(text);
+    result.root->visit(&rewriter);
+    if (rewriter.edits.empty())
+        return false;
+
+    std::sort(rewriter.edits.begin(), rewriter.edits.end(),
+              [](const HttpEdit& a, const HttpEdit& b) {
+                  return a.begin > b.begin;
+              });
+    for (const HttpEdit& edit : rewriter.edits)
+        text.replace(edit.begin, edit.end - edit.begin, edit.text);
+    return true;
+}
+
+/*
+ * A return of a chunk ends the whole chunk.  A chunk that came in parts
+ * runs in the same call, so a return of an early part has to stop the
+ * dispatcher before the parts that follow: every return that leaves the
+ * chunk gets a call of __wieen_stop(...) instead.  Returns inside
+ * functions are left alone - they leave the function, not the chunk.
+ */
+class ReturnCollector : public Luau::AstVisitor
+{
+public:
+    explicit ReturnCollector(const std::string& text)
+        : text(text)
+    {
+    }
+
+    bool visit(Luau::AstStatReturn* stat) override
+    {
+        returns.push_back({offset_of(text, stat->location.begin),
+                           offset_of(text, stat->location.end)});
+        return false;
+    }
+
+    bool visit(Luau::AstExprFunction*) override
+    {
+        return false;
+    }
+
+    std::vector<std::pair<size_t, size_t>> returns;
+
+private:
+    const std::string& text;
+};
+
+static void stop_returns(std::string& text)
+{
+    Luau::Allocator allocator;
+    Luau::AstNameTable names(allocator);
+    Luau::ParseOptions parseOptions;
+    Luau::ParseResult result =
+        Luau::Parser::parse(text.data(), text.size(), names, allocator, parseOptions);
+    if (!result.errors.empty() || !result.root)
+        return;
+
+    ReturnCollector collector(text);
+    result.root->visit(&collector);
+
+    /* from the end, so the offsets of the untouched text stay valid */
+    std::sort(collector.returns.begin(), collector.returns.end(),
+              [](const std::pair<size_t, size_t>& a,
+                 const std::pair<size_t, size_t>& b) {
+                  return a.first > b.first;
+              });
+    for (const std::pair<size_t, size_t>& place : collector.returns)
+    {
+        size_t begin = place.first;
+        size_t end = place.second;
+        if (begin >= end || end > text.size() ||
+            text.compare(begin, 6, "return") != 0)
+            continue;
+        std::string values = text.substr(begin + 6, end - begin - 6);
+        text.replace(begin, end - begin,
+                     "__wieen_stop = true; return" + values);
+    }
+}
+
+/*
+ * A chunk of a loadstring runs on its own: the local loadstring of the
+ * script that asked for it is not visible here, and the global one of the
+ * client does not work.  Every chunk gets the stub of its own, so a
+ * downloaded script may load another one the same way.
+ */
+static const char kLoadstringPrelude[] =
+    "local loadstring = function(src) return coroutine.yield(src) end\n";
+
+static bool compile_part(const std::string& piece, lua_CompileOptions options,
+                         bool keep_upstream, bool stopReturn,
+                         std::string& out, std::string& error)
+{
+    std::string text = stopReturn ? kLoadstringPrelude + piece : piece;
+    if (stopReturn)
+        stop_returns(text);
+    return compile_source(text, options, keep_upstream, out, error);
+}
+
+/*
  * Splits the script into parts that the client is able to load.  The
  * parts are the top level statements, grouped so that every part fits
  * into the limit of the loader.
  */
 static bool split_script(const std::string& source, lua_CompileOptions options,
-                         bool keep_upstream, std::vector<std::string>& parts,
+                         bool keep_upstream, bool stopReturn,
+                         std::vector<std::string>& parts,
                          std::string& error)
 {
     Luau::Allocator allocator;
@@ -387,7 +605,7 @@ static bool split_script(const std::string& source, lua_CompileOptions options,
 
         std::string piece = text.substr(partBegin, end - partBegin);
         std::string bytes;
-        if (!compile_source(piece, options, keep_upstream, bytes, error))
+        if (!compile_part(piece, options, keep_upstream, stopReturn, bytes, error))
             return false;
         if (bytes.size() > kPartLimit)
         {
@@ -395,7 +613,7 @@ static bool split_script(const std::string& source, lua_CompileOptions options,
             lua_CompileOptions plain = options;
             plain.debugLevel = 0;
             std::string smaller;
-            if (compile_source(piece, plain, keep_upstream, smaller, error) &&
+            if (compile_part(piece, plain, keep_upstream, stopReturn, smaller, error) &&
                 smaller.size() < bytes.size())
             {
                 bytes = smaller;
@@ -412,21 +630,21 @@ static bool split_script(const std::string& source, lua_CompileOptions options,
             {
                 /* the part ends before this statement */
                 std::string done;
-                if (!compile_source(text.substr(partBegin, partEnd - partBegin),
-                                    options, keep_upstream, done, error))
+                if (!compile_part(text.substr(partBegin, partEnd - partBegin),
+                                 options, keep_upstream, stopReturn, done, error))
                     return false;
                 parts.push_back(done);
                 partBegin = partEnd;
                 haveStatement = false;
                 piece = text.substr(partBegin, end - partBegin);
-                if (!compile_source(piece, options, keep_upstream, bytes, error))
+                if (!compile_part(piece, options, keep_upstream, stopReturn, bytes, error))
                     return false;
                 if (bytes.size() > kPartLimit)
                 {
                     lua_CompileOptions plain = options;
                     plain.debugLevel = 0;
                     std::string smaller;
-                    if (compile_source(piece, plain, keep_upstream, smaller, error) &&
+                    if (compile_part(piece, plain, keep_upstream, stopReturn, smaller, error) &&
                         smaller.size() < bytes.size())
                     {
                         bytes = smaller;
@@ -454,8 +672,8 @@ static bool split_script(const std::string& source, lua_CompileOptions options,
     if (haveStatement)
     {
         std::string done;
-        if (!compile_source(text.substr(partBegin, partEnd - partBegin), options,
-                            keep_upstream, done, error))
+        if (!compile_part(text.substr(partBegin, partEnd - partBegin), options,
+                         keep_upstream, stopReturn, done, error))
             return false;
         parts.push_back(done);
     }
@@ -470,6 +688,46 @@ static bool split_script(const std::string& source, lua_CompileOptions options,
 static std::string frame_parts(const std::vector<std::string>& parts)
 {
     std::string out = "WIEENMUL";
+    unsigned long count = (unsigned long)parts.size();
+    for (int i = 0; i < 4; i++)
+        out += (char)((count >> (8 * i)) & 0xff);
+    for (const std::string& part : parts)
+    {
+        unsigned long len = (unsigned long)part.size();
+        for (int i = 0; i < 4; i++)
+            out += (char)((len >> (8 * i)) & 0xff);
+        out += part;
+    }
+    return out;
+}
+
+/*
+ * A loadstring source that does not fit into one chunk is compiled into
+ * parts plus a dispatcher.  The dispatcher takes the functions of the
+ * parts and returns one function: calling it runs the parts in order.
+ * The parts share their top level state through globals, and a return of
+ * any part stops the dispatcher (see stop_returns above).
+ */
+static const char kLoadstringDispatcher[] =
+    "local p = {...}\n"
+    "return function(...)\n"
+    " __wieen_stop = nil\n"
+    " local r = {}\n"
+    " for i = 1, #p do\n"
+    "  r = {p[i](...)}\n"
+    "  if __wieen_stop then break end\n"
+    " end\n"
+    " return table.unpack(r)\n"
+    "end\n";
+
+static std::string frame_loadstring(const std::string& dispatcher,
+                                    const std::vector<std::string>& parts)
+{
+    std::string out = "WIEENLSP";
+    unsigned long dlen = (unsigned long)dispatcher.size();
+    for (int i = 0; i < 4; i++)
+        out += (char)((dlen >> (8 * i)) & 0xff);
+    out += dispatcher;
     unsigned long count = (unsigned long)parts.size();
     for (int i = 0; i < 4; i++)
         out += (char)((count >> (8 * i)) & 0xff);
@@ -515,7 +773,17 @@ int main(int argc, char** argv)
      * that way a top level "return" works and the result can be turned
      * into a string for us.
      */
-    bool wrap = !(argc > 2 && strcmp(argv[2], "--raw") == 0);
+    bool raw = false;
+    bool loadstring = false;
+    for (int i = 2; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--raw") == 0)
+            raw = true;
+        if (strcmp(argv[i], "--loadstring") == 0)
+            loadstring = true;
+    }
+    bool wrap = !raw && !loadstring;
+
     std::string wrapped;
     if (wrap)
     {
@@ -526,6 +794,11 @@ int main(int argc, char** argv)
          * a script that returns nothing is a nil instead of an error.
          */
         wrapped += "\nend\nreturn tostring((__wieen()))\n";
+    }
+    else if (loadstring)
+    {
+        wrapped = kLoadstringPrelude;
+        wrapped += source;
     }
     else
     {
@@ -561,12 +834,55 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (loadstring)
+    {
+        /*
+         * A loadstring source is a function, not a script that runs now:
+         * the parts are wrapped into a dispatcher that returns one
+         * function over all of them.
+         */
+        std::vector<std::string> parts;
+        if (!split_script(source, options, keep_upstream, true, parts, error))
+        {
+            fprintf(stderr, "wieen-compile: cannot split the loadstring: %s\n",
+                    error.c_str());
+            return 1;
+        }
+
+        std::string dispatcher;
+        if (!compile_source(kLoadstringDispatcher, options, keep_upstream,
+                            dispatcher, error))
+        {
+            fprintf(stderr, "wieen-compile: %s\n", error.c_str());
+            return 1;
+        }
+        if (dispatcher.size() > kPartLimit)
+        {
+            lua_CompileOptions plain = options;
+            plain.debugLevel = 0;
+            std::string smaller;
+            if (compile_source(kLoadstringDispatcher, plain, keep_upstream,
+                               smaller, error))
+                dispatcher = smaller;
+        }
+        if (dispatcher.size() > kPartLimit)
+        {
+            fprintf(stderr, "wieen-compile: the loadstring dispatcher is "
+                            "too big for the loader of the client\n");
+            return 1;
+        }
+
+        std::string framed = frame_loadstring(dispatcher, parts);
+        fwrite(framed.data(), 1, framed.size(), stdout);
+        return 0;
+    }
+
     /*
      * The script does not fit into the bytecode the client is willing to
      * load, so it is split into parts that do.
      */
     std::vector<std::string> parts;
-    if (!split_script(source, options, keep_upstream, parts, error))
+    if (!split_script(source, options, keep_upstream, false, parts, error))
     {
         fprintf(stderr, "wieen-compile: cannot split the script: %s\n", error.c_str());
         return 1;

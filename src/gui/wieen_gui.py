@@ -25,14 +25,15 @@ import time
 import traceback
 from pathlib import Path
 
-from PyQt6.QtCore import (QAbstractAnimation, QEasingCurve, QPoint,
-                          QProcess, QRectF, QPropertyAnimation, QSize, Qt,
-                          QTimer, pyqtProperty, pyqtSignal)
+from PyQt6.QtCore import (QAbstractAnimation, QEasingCurve, QPoint, QPointF,
+                          QProcess, QProcessEnvironment, QRectF,
+                          QPropertyAnimation, QSize, Qt, QTimer, pyqtProperty,
+                          pyqtSignal)
 from PyQt6.QtGui import (QColor, QFont, QFontDatabase, QIcon, QKeySequence,
                          QLinearGradient, QPainter, QPainterPath, QPalette,
-                         QRadialGradient, QShortcut, QTextCharFormat,
+                         QPen, QRadialGradient, QShortcut, QTextCharFormat,
                          QSyntaxHighlighter)
-from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QFrame,
+from PyQt6.QtWidgets import (QApplication, QFileDialog, QFrame,
                              QGraphicsBlurEffect, QGraphicsOpacityEffect,
                              QHBoxLayout, QLabel, QMainWindow,
                              QPlainTextEdit, QPushButton, QStackedWidget,
@@ -149,9 +150,11 @@ QToolTip {{
 class SoftButton(QPushButton):
     """A rounded button that is painted, not styled: a sheet of glass."""
 
-    def __init__(self, text: str, primary: bool = False, parent=None):
+    def __init__(self, text: str, primary: bool = False, parent=None,
+                 icon: str | None = None):
         super().__init__(text, parent)
         self.primary = primary
+        self.icon = icon
         self._hover = 0.0
         self.setFont(mono(10))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -164,6 +167,8 @@ class SoftButton(QPushButton):
 
     def sizeHint(self) -> QSize:
         w = self.fontMetrics().horizontalAdvance(self.text()) + 34
+        if self.icon:
+            w += 21
         return QSize(max(w, 64), 32)
 
     @pyqtProperty(float)
@@ -218,7 +223,99 @@ class SoftButton(QPushButton):
         else:
             p.setPen(QColor(FAINT))
         p.setFont(self.font())
-        p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), self.text())
+        color = p.pen().color()
+        text_w = self.fontMetrics().horizontalAdvance(self.text())
+        icon_w = 14 if self.icon else 0
+        gap = 7 if self.icon else 0
+        total = icon_w + gap + text_w
+        left = (self.width() - total) / 2
+        if self.icon:
+            self._paint_icon(p, left, self.height() / 2, color)
+            text_rect = QRectF(left + icon_w + gap, 0,
+                               text_w + 2, self.height())
+            p.drawText(text_rect,
+                       int(Qt.AlignmentFlag.AlignVCenter |
+                           Qt.AlignmentFlag.AlignLeft), self.text())
+        else:
+            p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter),
+                       self.text())
+
+    def _paint_icon(self, p: QPainter, x: float, cy: float,
+                    color: QColor) -> None:
+        """A small line icon, drawn where the text would start."""
+        kind = self.icon
+        if not kind:
+            return
+        s = 14.0
+        top = cy - s / 2
+        p.save()
+        pen = QPen(color, 1.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if kind == "run":
+            path = QPainterPath()
+            path.moveTo(x + 2.5, top + 1.8)
+            path.lineTo(x + 12.0, cy)
+            path.lineTo(x + 2.5, top + s - 1.8)
+            path.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            p.drawPath(path)
+        elif kind == "open":
+            p.drawRoundedRect(QRectF(x + 1.0, top + 4.0, 12.0, 8.5), 1.6,
+                              1.6)
+            path = QPainterPath()
+            path.moveTo(x + 1.0, top + 4.5)
+            path.lineTo(x + 1.0, top + 2.2)
+            path.quadTo(x + 1.0, top + 1.4, x + 2.0, top + 1.4)
+            path.lineTo(x + 5.4, top + 1.4)
+            path.lineTo(x + 6.8, top + 3.2)
+            path.lineTo(x + 11.0, top + 3.2)
+            path.quadTo(x + 12.0, top + 3.2, x + 12.0, top + 4.0)
+            p.drawPath(path)
+        elif kind == "save":
+            p.drawRoundedRect(QRectF(x + 1.5, top + 1.5, 11.0, 11.0), 1.8,
+                              1.8)
+            p.drawRoundedRect(QRectF(x + 4.2, top + 1.5, 5.6, 4.0), 0.8,
+                              0.8)
+            p.drawRoundedRect(QRectF(x + 4.0, top + 8.0, 6.0, 4.5), 0.8,
+                              0.8)
+        elif kind == "clear":
+            p.drawLine(QPointF(x + 2.0, top + 3.2),
+                       QPointF(x + 12.0, top + 3.2))
+            p.drawLine(QPointF(x + 5.0, top + 3.2),
+                       QPointF(x + 5.0, top + 1.6))
+            p.drawLine(QPointF(x + 9.0, top + 3.2),
+                       QPointF(x + 9.0, top + 1.6))
+            p.drawLine(QPointF(x + 5.0, top + 1.6),
+                       QPointF(x + 9.0, top + 1.6))
+            path = QPainterPath()
+            path.moveTo(x + 3.2, top + 4.0)
+            path.lineTo(x + 4.2, top + 12.4)
+            path.quadTo(x + 4.3, top + 13.2, x + 5.1, top + 13.2)
+            path.lineTo(x + 8.9, top + 13.2)
+            path.quadTo(x + 9.7, top + 13.2, x + 9.8, top + 12.4)
+            path.lineTo(x + 10.8, top + 4.0)
+            p.drawPath(path)
+        elif kind == "attach":
+            p.drawEllipse(QRectF(x + 1.0, top + 3.4, 6.0, 7.2))
+            p.drawEllipse(QRectF(x + 7.0, top + 3.4, 6.0, 7.2))
+            p.drawLine(QPointF(x + 4.0, cy), QPointF(x + 10.0, cy))
+        elif kind == "bolt":
+            path = QPainterPath()
+            path.moveTo(x + 7.8, top + 0.8)
+            path.lineTo(x + 2.6, top + 8.0)
+            path.lineTo(x + 6.6, top + 8.0)
+            path.lineTo(x + 5.4, top + 13.2)
+            path.lineTo(x + 11.4, top + 5.6)
+            path.lineTo(x + 7.2, top + 5.6)
+            path.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            p.drawPath(path)
+        p.restore()
 
 
 class GlassCard(QWidget):
@@ -301,96 +398,6 @@ class Backdrop(QWidget):
 
 
 # ------------------------------------------------------------------ tabs
-
-
-class StepRow(QWidget):
-    """One numbered step inside the rail: hover wash, mark, hint."""
-
-    clicked = pyqtSignal()
-
-    def __init__(self, number: str, title: str, hint: str, parent=None):
-        super().__init__(parent)
-        self._hover = 0.0
-        self._mark = "—"
-        self._mark_color = FAINT
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
-        self.setMinimumHeight(56)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 10, 12, 11)
-        lay.setSpacing(3)
-
-        row = QHBoxLayout()
-        row.setSpacing(9)
-        self.num = QLabel(number)
-        self.num.setFont(mono(9))
-        self.num.setStyleSheet(f"color: {FAINT};")
-        self.title = QLabel(title)
-        self.title.setFont(mono(10, QFont.Weight.DemiBold))
-        self.title.setStyleSheet(f"color: {TEXT}; letter-spacing: 2px;")
-        self.mark = QLabel(self._mark)
-        self.mark.setFont(mono(10))
-        self.mark.setStyleSheet(f"color: {FAINT};")
-        row.addWidget(self.num)
-        row.addWidget(self.title)
-        row.addStretch(1)
-        row.addWidget(self.mark)
-        lay.addLayout(row)
-
-        self.hint = QLabel(hint)
-        self.hint.setFont(mono(9))
-        self.hint.setWordWrap(True)
-        self.hint.setStyleSheet(f"color: {FAINT};")
-        lay.addWidget(self.hint)
-
-        self._anim = QPropertyAnimation(self, b"wash", self)
-        self._anim.setDuration(160)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-    def set_state(self, mark: str, color: str) -> None:
-        self._mark = mark
-        self._mark_color = color
-        self.mark.setText(mark)
-        self.mark.setStyleSheet(f"color: {color};")
-
-    def set_hint(self, hint: str) -> None:
-        self.hint.setText(hint)
-
-    @pyqtProperty(float)
-    def wash(self) -> float:
-        return self._hover
-
-    @wash.setter
-    def wash(self, value: float) -> None:
-        self._hover = value
-
-    def animate_to(self, value: float) -> None:
-        self._anim.stop()
-        self._anim.setStartValue(self._hover)
-        self._anim.setEndValue(value)
-        self._anim.start()
-
-    def enterEvent(self, event) -> None:
-        self.animate_to(1.0)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        self.animate_to(0.0)
-        super().leaveEvent(event)
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-
-    def paintEvent(self, event) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = QRectF(self.rect()).adjusted(0, 0, 0, -1)
-        if self._hover > 0.004:
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(255, 255, 255, int(9 * self._hover)))
-            p.drawRoundedRect(r.adjusted(0, 1, 0, -1), 10, 10)
 
 
 class TabBar(QWidget):
@@ -679,143 +686,6 @@ class App(QApplication):
             return False
 
 
-class MomentumDialog(QDialog):
-    """The three steps of the injector, run without a single click.
-
-    Build, install, launch.  Everything the host says lands in the log of
-    the dialog; when Sober is on its way the dialog asks for the two things
-    a program cannot do: enter a place and press ATTACH.
-    """
-
-    def __init__(self, window: "Window"):
-        super().__init__(window)
-        self.window = window
-        self.proc: QProcess | None = None
-        self.setWindowTitle("Momentum Run")
-        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
-        self.setMinimumSize(620, 560)
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        backdrop = Backdrop()
-        root.addWidget(backdrop)
-        outer = QVBoxLayout(backdrop)
-        outer.setContentsMargins(18, 18, 18, 18)
-
-        card = GlassCard()
-        outer.addWidget(card)
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(20, 18, 20, 18)
-        lay.setSpacing(12)
-
-        title = QLabel("MOMENTUM RUN")
-        title.setFont(mono(10, QFont.Weight.DemiBold))
-        title.setStyleSheet(f"color: {WHITE}; letter-spacing: 4px;")
-        lay.addWidget(title)
-
-        self.rows: list[StepRow] = []
-        for number, name, hint in (("01", "BUILD", "agent and compiler"),
-                                   ("02", "INSTALL", "preload in the runtime"),
-                                   ("03", "LAUNCH", "Sober, agent inside")):
-            row = StepRow(number, name, hint)
-            row.setCursor(Qt.CursorShape.ArrowCursor)
-            row.setMinimumHeight(46)
-            self.rows.append(row)
-            lay.addWidget(row)
-
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setFont(mono(10))
-        self.log.setFrameShape(QFrame.Shape.NoFrame)
-        self.log.setPlaceholderText("output")
-        self.log.setMinimumHeight(140)
-        lay.addWidget(self.log, 1)
-
-        self.hint = QLabel("building and starting, nothing to press")
-        self.hint.setFont(mono(9))
-        self.hint.setWordWrap(True)
-        self.hint.setStyleSheet(f"color: {DIM};")
-        lay.addWidget(self.hint)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        self.close_button = SoftButton("CLOSE")
-        self.close_button.clicked.connect(self.close)
-        buttons.addWidget(self.close_button)
-        lay.addLayout(buttons)
-
-    # -- the run itself
-
-    def start(self) -> None:
-        if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
-            return
-        for row in self.rows:
-            row.set_state("—", FAINT)
-        self.close_button.setEnabled(False)
-        self.log.clear()
-        self.hint.setText("building the agent and the compiler")
-        self.hint.setStyleSheet(f"color: {DIM};")
-        self.rows[0].set_state("…", DIM)
-        self.run(["make", "agent", "compile"], self.build_done)
-
-    def run(self, argv: list[str], done) -> None:
-        proc = QProcess(self)
-        self.proc = proc
-        proc.setWorkingDirectory(str(REPO))
-        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        proc.readyReadStandardOutput.connect(self.read)
-        proc.finished.connect(done)
-        proc.start(argv[0], argv[1:])
-
-    def read(self) -> None:
-        if not self.proc:
-            return
-        text = bytes(self.proc.readAllStandardOutput()).decode(
-            errors="replace")
-        for line in text.splitlines():
-            if line.strip():
-                self.log.appendPlainText(line.rstrip())
-                bar = self.log.verticalScrollBar()
-                bar.setValue(bar.maximum())
-
-    def build_done(self, code: int, _status) -> None:
-        if code != 0:
-            self.fail("the build failed, read the output above")
-            return
-        self.rows[0].set_state("✓", OK)
-        self.rows[1].set_state("…", DIM)
-        self.hint.setText("registering the preload in the runtime "
-                          "(may ask for a password)")
-        script = REPO / "tools" / "install_preload.sh"
-        self.run(["sh", "-c", f'sudo -n bash "{script}" || '
-                             f'pkexec env SUDO_HOME="$HOME" bash "{script}"'],
-                 self.install_done)
-
-    def install_done(self, code: int, _status) -> None:
-        if code != 0:
-            self.fail("the preload was not registered (root is needed)")
-            return
-        self.rows[1].set_state("✓", OK)
-        self.rows[2].set_state("…", DIM)
-        self.hint.setText("starting Sober")
-        if not self.window.start_sober():
-            self.fail("Sober did not start")
-            return
-        self.rows[2].set_state("✓", OK)
-        self.hint.setText("Sober is up. enter a place, then press ATTACH "
-                          "in the main window.")
-        self.hint.setStyleSheet(f"color: {OK};")
-        self.close_button.setEnabled(True)
-
-    def fail(self, message: str) -> None:
-        for row in self.rows:
-            if row.mark.text() == "…":
-                row.set_state("×", ERR)
-        self.hint.setText(message)
-        self.hint.setStyleSheet(f"color: {ERR};")
-        self.close_button.setEnabled(True)
-
-
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -832,7 +702,8 @@ class Window(QMainWindow):
         self.place = ""
         self.busy = False
         self.launch_proc: QProcess | None = None
-        self.momentum_dialog: MomentumDialog | None = None
+        self.momentum_proc: QProcess | None = None
+        self.momentum_step = 0
         self.jobs: list[tuple[Task, object]] = []
         self._anims: list[QPropertyAnimation] = []
         self._pulse_value = 1.0
@@ -848,7 +719,6 @@ class Window(QMainWindow):
 
         body = QHBoxLayout()
         body.setSpacing(14)
-        body.addWidget(self.build_rail())
         body.addWidget(self.build_workspace(), 1)
         root.addLayout(body, 1)
 
@@ -949,52 +819,75 @@ class Window(QMainWindow):
         lay.addWidget(self.clock)
         return bar
 
-    # -- rail
-
-    def build_rail(self) -> QWidget:
-        rail = QWidget()
-        rail.setFixedWidth(268)
-        lay = QVBoxLayout(rail)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(12)
-
-        card = GlassCard()
-        cl = QVBoxLayout(card)
-        cl.setContentsMargins(16, 16, 16, 16)
-        cl.setSpacing(9)
-
-        self.momentum_button = SoftButton("MOMENTUM RUN", primary=True)
-        self.momentum_button.setFixedHeight(46)
-        self.momentum_button.setFont(mono(11, QFont.Weight.DemiBold))
-        self.momentum_button.setToolTip(
-            "build the agent, register the preload, start Sober")
-        self.momentum_button.clicked.connect(self.on_momentum)
-        cl.addWidget(self.momentum_button)
-
-        line = QFrame()
-        line.setFixedHeight(1)
-        line.setStyleSheet(f"background: rgba(255, 255, 255, 9%);")
-        cl.addWidget(line)
-
-        self.attach_button = SoftButton("ATTACH")
-        self.attach_button.setFixedHeight(44)
-        self.attach_button.setFont(mono(11, QFont.Weight.DemiBold))
-        self.attach_button.setToolTip(
-            "connect to the game and post the notification")
-        self.attach_button.clicked.connect(self.on_attach)
-        cl.addWidget(self.attach_button)
-
-        lay.addWidget(card)
-        lay.addStretch(1)
-        return rail
+    # -- momentum run
 
     def on_momentum(self) -> None:
-        if self.momentum_dialog is None:
-            self.momentum_dialog = MomentumDialog(self)
-        self.momentum_dialog.show()
-        self.momentum_dialog.raise_()
-        self.momentum_dialog.activateWindow()
-        self.momentum_dialog.start()
+        """Build, register, launch — straight from the page, no dialog."""
+        if self.busy:
+            return
+        if self.momentum_proc and self.momentum_proc.state() != \
+                QProcess.ProcessState.NotRunning:
+            self.log("momentum run is already going", DIM, "01")
+            return
+        self.set_busy(True, "momentum")
+        self.momentum_step = 0
+        self.tabs.select(0)
+        self.log("momentum run: build the agent and the compiler", DIM, "01")
+        self.start_momentum(["make", "agent", "compile"], 0)
+
+    def start_momentum(self, argv: list[str], step: int) -> None:
+        proc = QProcess(self)
+        self.momentum_proc = proc
+        self.momentum_step = step
+        proc.setWorkingDirectory(str(REPO))
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        proc.readyReadStandardOutput.connect(self.read_momentum)
+        proc.finished.connect(self.momentum_done)
+        proc.start(argv[0], argv[1:])
+        if not proc.waitForStarted(5000):
+            self.momentum_fail("the process did not start")
+
+    def read_momentum(self) -> None:
+        if not self.momentum_proc:
+            return
+        text = bytes(self.momentum_proc.readAllStandardOutput()).decode(
+            errors="replace")
+        prefix = ("01", "02", "03")[min(self.momentum_step, 2)]
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            low = line.lower()
+            if any(word in low for word in ("error", "fatal", "failed")):
+                self.log(line, ERR, prefix)
+            else:
+                self.log(line, DIM, prefix)
+
+    def momentum_done(self, code: int, _status) -> None:
+        if code != 0:
+            self.momentum_fail(f"step {self.momentum_step + 1} failed "
+                               f"(exit {code})")
+            return
+        if self.momentum_step == 0:
+            self.log("preload: register it in the runtime", DIM, "02")
+            script = REPO / "tools" / "install_preload.sh"
+            self.start_momentum(
+                ["sh", "-c", f'sudo -n bash "{script}" || '
+                             f'pkexec env SUDO_HOME="$HOME" bash "{script}"'],
+                1)
+        elif self.momentum_step == 1:
+            self.log("launch: starting Sober", DIM, "03")
+            if not self.start_sober():
+                self.momentum_fail("Sober did not start")
+                return
+            self.set_busy(False)
+            self.log("momentum run: enter a place, then press ATTACH",
+                     OK, "03")
+        else:
+            self.set_busy(False)
+
+    def momentum_fail(self, message: str) -> None:
+        self.log(f"momentum run: {message}", ERR, "!")
+        self.set_busy(False)
 
     # -- workspace
 
@@ -1038,15 +931,28 @@ class Window(QMainWindow):
         head.addWidget(self.file_label)
         head.addStretch(1)
 
-        self.run_button = SoftButton("RUN", primary=True)
+        self.attach_button = SoftButton("ATTACH", icon="attach")
+        self.attach_button.setToolTip(
+            "connect to the game and post the notification")
+        self.attach_button.clicked.connect(self.on_attach)
+        head.addWidget(self.attach_button)
+
+        self.momentum_button = SoftButton("MOMENTUM RUN", icon="bolt")
+        self.momentum_button.setToolTip(
+            "build the agent, register the preload, start Sober")
+        self.momentum_button.clicked.connect(self.on_momentum)
+        head.addWidget(self.momentum_button)
+
+        self.run_button = SoftButton("RUN", primary=True, icon="run")
         self.run_button.setToolTip("run the script in the game (ctrl+enter)")
         self.run_button.setEnabled(False)
         self.run_button.clicked.connect(self.on_run)
         head.addWidget(self.run_button)
-        for label, slot, tip in (("OPEN", self.on_open, "ctrl+o"),
-                                 ("SAVE", self.on_save, "ctrl+s"),
-                                 ("CLEAR", self.clear_script, "erase the text")):
-            b = SoftButton(label)
+        for label, slot, tip, icon in (
+                ("OPEN", self.on_open, "ctrl+o", "open"),
+                ("SAVE", self.on_save, "ctrl+s", "save"),
+                ("CLEAR", self.clear_script, "erase the text", "clear")):
+            b = SoftButton(label, icon=icon)
             b.setToolTip(tip)
             b.clicked.connect(slot)
             head.addWidget(b)
@@ -1071,7 +977,7 @@ class Window(QMainWindow):
         title.setStyleSheet(f"color: {FAINT}; letter-spacing: 2px;")
         head.addWidget(title)
         head.addStretch(1)
-        clear = SoftButton("CLEAR")
+        clear = SoftButton("CLEAR", icon="clear")
         clear.setToolTip("wipe the console")
         clear.clicked.connect(lambda: self.console.clear())
         head.addWidget(clear)
@@ -1131,6 +1037,10 @@ class Window(QMainWindow):
         self.jobs.clear()
         self.clock_timer.stop()
         self.beat_anim.stop()
+        if self.momentum_proc and self.momentum_proc.state() != \
+                QProcess.ProcessState.NotRunning:
+            self.momentum_proc.terminate()
+            self.momentum_proc.waitForFinished(1500)
         for a in self._anims:
             a.stop()
             a.setTargetObject(None)
@@ -1240,6 +1150,7 @@ class Window(QMainWindow):
         self.place_sep.setVisible(bool(self.place))
 
         self.run_button.setEnabled(self.attached and not self.busy)
+        self.momentum_button.setEnabled(not self.busy)
         self.attach_button.primary = False
         self.attach_button.setEnabled(not self.busy)
         self.attach_button.setText("ATTACHED" if self.attached else "ATTACH")
@@ -1355,6 +1266,11 @@ class Window(QMainWindow):
         self.launch_proc = proc
         proc.setWorkingDirectory(str(REPO))
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        # The greeting needs the game thread: without this the agent builds
+        # a low-capability thread where game:GetService("Players") is nil.
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("WIEEN_INTHREAD", "1")
+        proc.setProcessEnvironment(env)
         proc.readyReadStandardOutput.connect(self.read_launch)
         proc.finished.connect(self.launch_done)
         proc.start(PY, [str(CLI), "launch"])

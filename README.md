@@ -36,7 +36,19 @@ $ python3 src/cli/wieen.py exec 'return tostring(workspace.CurrentCamera.FieldOf
 
 $ python3 src/cli/wieen.py exec 'local f = loadstring("return 6*7") return f()'
 42
+
+$ python3 src/cli/wieen.py exec 'local f = loadstring("https://example.com/script.luau") return f()'
 ```
+
+`loadstring` takes source code, and it also takes a link: the host downloads
+it, compiles it and hands the client a real function. Big sources are split
+the same way as ordinary scripts, and the chunk gets the stub of its own, so
+a downloaded script may `loadstring` another one — a link inside a link works
+too. The client has no HTTP client of its own (`game:HttpGet` does not exist
+there), so every download happens on the host: `game:HttpGet(url)` and
+`game:HttpGetAsync(url)` are rewritten into a call of the host, and the usual
+`loadstring(game:HttpGet(url))()` is turned into `loadstring(url)` — the link
+goes straight to the compiler, without the text passing through the client.
 
 ## Features
 
@@ -46,7 +58,7 @@ $ python3 src/cli/wieen.py exec 'local f = loadstring("return 6*7") return f()'
 | **Real capabilities** | The chunk is lent the capabilities of the game thread, so `Instance.new`, property writes and camera access work — not just reading `game`. |
 | **No code patching** | Not a single byte of the client is rewritten. The hook lives in the writable callback slot of the Luau state, which the client's integrity check never looks at. |
 | **Long scripts** | Anything past the client's 279-byte loader limit is split at statement boundaries; the pieces share one environment. |
-| **`loadstring`** | Compiled by the host, loaded by the client, returned as a real function. |
+| **`loadstring`** | Compiled by the host, loaded by the client, returned as a real function. A link is downloaded, compiled and split the same way. |
 | **Greets the player** | As soon as the experience is selected, the agent posts a `pwned by Wieen` notification through the client's own API and writes a line into the F9 console. |
 | **UNIX socket, plain text** | The host talks to the agent over `wieen.sock`; anything that can write to a socket can drive it. |
 
