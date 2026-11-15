@@ -33,7 +33,7 @@ LUAU_LIB  := $(LUAU_DIR)/build-rel
 # where the agent lives inside the flatpak sandbox
 SOBER_DATA := $(HOME)/.var/app/org.vinegarhq.Sober/data/wieen
 
-.PHONY: all agent compile deploy install symbols clean
+.PHONY: all agent compile deploy install symbols clean gui
 
 all: agent compile
 
@@ -84,6 +84,9 @@ install: deploy
 # regenerate the Luau symbol table for the current Roblox client build
 symbols:
 	python3 tools/scan_symbols.py
+
+gui:
+	python3 src/gui/wieen_gui.py
 
 clean:
 	rm -rf $(BUILD_DIR)

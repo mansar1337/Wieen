@@ -240,6 +240,31 @@ static int wieen_pcall(void* L, int nargs, int nresults, int errfunc);
 static int is_mapped(void* p);
 static void refresh_maps(void);
 
+/*
+ * A mask of capabilities can be named in a file of the data directory of the
+ * agent: the environment of the client is fixed at launch, and a sweep of
+ * the masks has to happen without restarting the game.  The file is read
+ * before every call, so a new value is picked up by the next script.
+ */
+static int read_mask_file(const char* name, unsigned long long* out)
+{
+    char path[512];
+    const char* home = getenv("HOME");
+    if (!home)
+        return 0;
+    snprintf(path, sizeof(path), "%s%s/%s", home, LOG_DIR_SUFFIX, name);
+    FILE* f = fopen(path, "r");
+    if (!f)
+        return 0;
+    unsigned long long v = 0;
+    int n = fscanf(f, "%llx", &v);
+    fclose(f);
+    if (n != 1)
+        return 0;
+    *out = v;
+    return 1;
+}
+
 /* A file in the data directory of the agent asks for a dump of the state
  * on the next call.  The environment of the client is fixed at launch, so
  * a flag that has to be read at runtime is cheaper this way. */
@@ -408,7 +433,7 @@ struct maprange
     unsigned long hi;
 };
 
-static struct maprange g_maps[1024];
+static struct maprange g_maps[16384];
 static int g_mapcount;
 
 static void refresh_maps(void)
@@ -610,8 +635,7 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
          */
         unsigned int caps =
             *(unsigned int*)((const unsigned char*)parent + LSTATE_CAPS);
-        if (env_flag("WIEEN_RICHCAPS"))
-            caps |= g_rich_caps;
+        caps |= g_rich_caps;
         *(unsigned int*)((unsigned char*)thread + LSTATE_CAPS) = caps;
         wieen_log("wieen: the capabilities of the thread are %#x\n", caps);
 
@@ -742,6 +766,8 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                 (unsigned int*)((unsigned char*)parent + LSTATE_CAPS);
             unsigned int savedcaps = *caps;
             const char* gcaps = getenv("WIEEN_GAMECAPS");
+            unsigned long long file_mask = 0;
+            int have_file_mask = read_mask_file("caps.txt", &file_mask);
             int lent = 0;
             if (gcaps && *gcaps)
             {
@@ -749,6 +775,13 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                 lent = 1;
                 wieen_log("wieen: the mask of the game is lent as %#x (was "
                           "%#x)\n", *caps, savedcaps);
+            }
+            else if (have_file_mask)
+            {
+                *caps = (unsigned int)file_mask;
+                lent = 1;
+                wieen_log("wieen: the mask of the game is lent as %#x (was "
+                          "%#x, from caps.txt)\n", *caps, savedcaps);
             }
             else
             {
@@ -815,6 +848,24 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                     }
                 }
             }
+            if (caps64 && have_file_mask && (!tcaps || !*tcaps))
+            {
+                int looks_like_pointer =
+                    (*caps64 >= 0x7F0000000000ULL && *caps64 < 0x800000000000ULL) ||
+                    (*caps64 >= 0x550000000000ULL && *caps64 < 0x570000000000ULL);
+                if (looks_like_pointer)
+                    wieen_log("wieen: the field at %#lx looks like a pointer "
+                              "(%#llx), left alone\n", capsoff, *caps64);
+                else
+                {
+                    savedcaps64 = *caps64;
+                    *caps64 = file_mask;
+                    lent64 = 1;
+                    wieen_log("wieen: the caps of the sandbox are lent as "
+                              "%#llx (was %#llx, from caps.txt)\n", *caps64,
+                              savedcaps64);
+                }
+            }
             if (caps64 && tcaps && *tcaps)
             {
                 /*
@@ -874,12 +925,31 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             {
                 typedef void* (*fn_single)(void*, int);
                 fn_single single = (fn_single)(g_base + 0x2992ee0UL);
-                void* chk = single((void*)(g_base + 0x6f85d50UL), 0);
-                wieen_log("wieen: checker %p\n", chk);
-                if (chk && is_mapped(chk))
-                    for (int q = 0; q < 0x80; q += 8)
-                        wieen_log("wieen: chk+%02x = %#llx\n", q,
-                                  *(unsigned long long*)((char*)chk + q));
+                unsigned char* rec = (unsigned char*)(g_base + 0x6f85d50UL);
+                refresh_maps();
+                if (map_contains(rec + 0x18))
+                {
+                    wieen_log("wieen: lazy %p =", rec);
+                    for (int q = 0; q < 0x18; q += 8)
+                        wieen_log(" %#llx", *(unsigned long long*)(rec + q));
+                    wieen_log("\n");
+                }
+                void* chk0 = single(rec, 0);
+                void* chk1 = single(rec, 1);
+                wieen_log("wieen: checker0 %p mapped %d, checker1 %p mapped "
+                          "%d, maps %d\n", chk0, is_mapped(chk0), chk1,
+                          is_mapped(chk1), g_mapcount);
+                void* seen[2] = {chk0, chk1};
+                for (int s = 0; s < 2; s++)
+                {
+                    void* chk = seen[s];
+                    if (!chk || !map_contains(chk))
+                        continue;
+                    wieen_log("wieen: chk%d %p: +20 %p +30 %#llx +38 %p\n", s,
+                              chk, *(void**)((char*)chk + 0x20),
+                              *(unsigned long long*)((char*)chk + 0x30),
+                              *(void**)((char*)chk + 0x38));
+                }
             }
             void* fval = top - 16;
             void* closure = (fval && is_mapped(fval)) ? *(void**)fval : 0;
@@ -955,9 +1025,10 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             {
                 typedef void* (*fn_single)(void*, int);
                 fn_single single = (fn_single)(g_base + 0x2992ee0UL);
-                void* chk = single((void*)(g_base + 0x6f85d50UL), 0);
+                refresh_maps();
+                void* chk = single((void*)(g_base + 0x6f85d50UL), 1);
                 chkobj = chk;
-                if (chk && is_mapped((char*)chk + 0x38))
+                if (chk && map_contains((char*)chk + 0x38))
                 {
                     pchk = (unsigned long long*)((char*)chk + 0x30);
                     savedchk = *pchk;
@@ -967,6 +1038,9 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                     wieen_log("wieen: the caps of the checker are lent as "
                               "%#llx (was %#llx)\n", *pchk, savedchk);
                 }
+                else
+                    wieen_log("wieen: the checker is %p, the caps are not "
+                              "lent\n", chk);
             }
 
             pthread_t guard;
@@ -2197,6 +2271,10 @@ static void* watcher_thread(void* arg)
             install_preresume(chosen);
             g_global_state = chosen;
             g_want_experience = 0;
+            /* The app VM is replaced by the one of the experience: the
+             * greeting has not run yet, so it starts from the beginning. */
+            if (!g_toast_state)
+                g_toast_state = 1;
             wieen_log("wieen: the VM of the experience is %p, the scripts "
                       "run there now\n", chosen);
         }

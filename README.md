@@ -47,8 +47,45 @@ $ python3 src/cli/wieen.py exec 'local f = loadstring("return 6*7") return f()'
 | **No code patching** | Not a single byte of the client is rewritten. The hook lives in the writable callback slot of the Luau state, which the client's integrity check never looks at. |
 | **Long scripts** | Anything past the client's 279-byte loader limit is split at statement boundaries; the pieces share one environment. |
 | **`loadstring`** | Compiled by the host, loaded by the client, returned as a real function. |
-| **Greets the player** | As soon as the experience is selected, the agent posts a `Wieen injected!` notification through the client's own API and writes a line into the F9 console. |
+| **Greets the player** | As soon as the experience is selected, the agent posts a `pwned by Wieen` notification through the client's own API and writes a line into the F9 console. |
 | **UNIX socket, plain text** | The host talks to the agent over `wieen.sock`; anything that can write to a socket can drive it. |
+
+## The interface
+
+<p align="center">
+  <img src="docs/gui.png" alt="the interface of Wieen" width="860">
+</p>
+
+```sh
+make gui                        # or: python3 src/gui/wieen_gui.py
+python3 src/cli/wieen.py gui    # the same, from the CLI
+```
+
+Two buttons and two tabs. **MOMENTUM RUN** does the setup by itself: it opens
+a window that builds the agent and the compiler, registers the preload in the
+flatpak runtime (sudo when the ticket is warm, otherwise the polkit dialog)
+and starts Sober, marking each step as it goes and streaming the output.
+Then the window has nothing left to do — you enter a place and press
+**ATTACH**: the agent is asked where it is, and if the client is still in the
+menu it says so instead of pretending; once inside, the greeting is posted,
+the notification and the F9 line.
+
+<p align="center">
+  <img src="docs/momentum.png" alt="momentum run" width="620">
+</p>
+
+The workspace has two tabs — **script** and **agent**. The console is
+part of the script page, directly below the editor, so code and output stay
+visible together. A switch between tabs is alive: the page slides in from the
+side it came from, blurring from 16 to 0 while the veil over the stack burns
+off, and the pill of the tab bar travels with a slight overshoot.
+
+After the attach the script tab is live: `RUN` (or `ctrl+enter`) compiles the
+script on the host and runs it in the game's VM; the console below the
+editor shows what it printed and reports errors in red.
+`ctrl+o` / `ctrl+s` open and save `.luau` files. Nothing is painted with the
+default Qt palette: panels are frosted sheets, buttons are drawn by hand, and
+the only colours that mean anything are the state of the agent and errors.
 
 ## How it works
 
@@ -95,12 +132,12 @@ When the VM of the experience is chosen, the agent shows the player that it is
 there. Both channels belong to the client itself — no custom ScreenGui:
 
 ```lua
-local LOGO = "rbxassetid://96134879839401"   -- docs/logo.png, uploaded once
+local LOGO = "rbxassetid://113328400853000"   -- docs/logo.png, uploaded once
 
 local sg = game:GetService("StarterGui")
 local opt = {}
-opt.Title = "Wieen injected!"
-opt.Text = "pwned by wieen! t.me/WieenExploit"
+opt.Title = "pwned by Wieen"
+opt.Text = "t.me/WieenExploit"
 opt.Duration = 10
 opt.Icon = LOGO
 sg:SetCore("SendNotification", opt)
@@ -179,6 +216,7 @@ after `make deploy`.
 | `src/agent/wieen_agent.c` | the agent: finds the VM state, hooks the `pre-resume` slot, runs Luau, serves the UNIX socket |
 | `src/agent/luau_symbols.h` | generated offsets of the Luau API in the client image |
 | `src/cli/wieen.py` | host-side CLI |
+| `src/gui/wieen_gui.py` | the interface: install, launch, attach, editor, console |
 | `tools/wieen_compile.cpp` | host compiler + opcode translation into the client's format |
 | `tools/opcode_map.py` | recovers the client's opcode numbering → `tools/opcode_map.h` |
 | `tools/opcode_map.txt` | the table: upstream → internal slot → wire number |

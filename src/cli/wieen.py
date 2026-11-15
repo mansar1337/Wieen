@@ -255,6 +255,15 @@ def cmd_launch(args: argparse.Namespace) -> int:
     return subprocess.call(cmd)
 
 
+def cmd_gui(args: argparse.Namespace) -> int:
+    """Start the interface of the injector."""
+    script = REPO / "src" / "gui" / "wieen_gui.py"
+    if not script.exists():
+        print(f"interface missing: {script}", file=sys.stderr)
+        return 1
+    return subprocess.call([sys.executable, str(script)])
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     a = Agent()
     if not a.connect():
@@ -358,6 +367,9 @@ def main() -> int:
 
     sp = sub.add_parser("repl", help="interactive session")
     sp.set_defaults(func=cmd_repl)
+
+    sp = sub.add_parser("gui", help="the interface: install, launch, attach")
+    sp.set_defaults(func=cmd_gui)
 
     args = p.parse_args()
     return args.func(args)

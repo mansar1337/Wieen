@@ -24,17 +24,22 @@ end
 -- The logo of the notification is an image of Roblox, so it has to be
 -- uploaded once and referenced by its id: "rbxassetid://<id>".  While the
 -- string is empty the notification goes without it.
-local LOGO = "rbxassetid://96134879839401"
+local LOGO = "rbxassetid://113328400853000"
 
 local sg = game:GetService("StarterGui")
 local opt = {}
-opt.Title = "Wieen injected!"
-opt.Text = "pwned by wieen! t.me/WieenExploit"
+opt.Title = "pwned by Wieen"
+opt.Text = "t.me/WieenExploit"
 opt.Duration = 10
 if LOGO ~= "" then
     opt.Icon = LOGO
 end
 local ok = pcall(sg.SetCore, sg, "SendNotification", opt)
+if not ok and opt.Icon then
+    -- the icon is the first thing the client may refuse: the text matters
+    opt.Icon = nil
+    ok = pcall(sg.SetCore, sg, "SendNotification", opt)
+end
 if not ok then
     return "wait"
 end
