@@ -247,11 +247,58 @@ bool translate_opcodes(char* bytecode, size_t size, std::string& error)
 }  // namespace
 
 /*
- * The loader of the client takes bytecode of less than 280 bytes, so a
- * script that does not fit is split into parts that do.  The parts are
- * run one after another in the same VM.
+ * The loader of the client takes plain bytecode only below 0x118 bytes:
+ * above that it reads the blob as a container with a footer.  A blob of
+ * any size is taken once it is wrapped into one, so nothing has to be
+ * split into small pieces any more; the parts only have to stay under a
+ * sane cap in case a script is enormous.
  */
-static const size_t kPartLimit = 279;
+static const size_t kPartCap = 4 * 1024 * 1024;
+
+static void put_u32(std::string& s, size_t at, uint32_t v)
+{
+    s[at] = (char)(v & 0xff);
+    s[at + 1] = (char)((v >> 8) & 0xff);
+    s[at + 2] = (char)((v >> 16) & 0xff);
+    s[at + 3] = (char)((v >> 24) & 0xff);
+}
+
+/*
+ * The container of version 1.  The payload is the plain bytecode of Luau
+ * followed by 0x10 bytes of padding, then a footer of 0x18 bytes:
+ *
+ *   pad[0x00..0x03] ^ pad[0x08..0x0b]      == 0x946ac432
+ *   u16(footer[0x00])                      == 0xc432
+ *   footer[0x02], footer[0x03]             == 0x6a, version
+ *   footer[0x10..0x13]                     == mark ^ 0x74171870
+ *
+ * The words at the end of the footer are the ones the first pair is
+ * xored with; they are zero here, so the pair itself carries the mark.
+ * Version 1 checks the payload, and the value it compares against is the
+ * mark with the seed folded in - which does not depend on the payload,
+ * so every payload passes.
+ */
+static std::string with_container(const std::string& bytes)
+{
+    if (bytes.size() < 0x118)
+        return bytes;
+
+    const uint32_t kMark = 0x946ac432;
+    const uint32_t kSeed = 0x74171870;
+
+    std::string out = bytes;
+    out.append(0x10, '\0');
+    put_u32(out, out.size() - 8, kMark);
+
+    std::string footer(0x18, '\0');
+    footer[0] = (char)0x32;
+    footer[1] = (char)0xc4;
+    footer[2] = (char)0x6a;
+    footer[3] = (char)0x01;
+    put_u32(footer, 0x10, 0x016ac432u ^ kSeed);
+    out += footer;
+    return out;
+}
 
 /* defined below: a call of game:HttpGet becomes a call of the host */
 static bool rewrite_httpget(std::string& text);
@@ -607,7 +654,7 @@ static bool split_script(const std::string& source, lua_CompileOptions options,
         std::string bytes;
         if (!compile_part(piece, options, keep_upstream, stopReturn, bytes, error))
             return false;
-        if (bytes.size() > kPartLimit)
+        if (bytes.size() > kPartCap)
         {
             /* without the information about the lines the part is smaller */
             lua_CompileOptions plain = options;
@@ -621,7 +668,7 @@ static bool split_script(const std::string& source, lua_CompileOptions options,
             }
         }
 
-        if (bytes.size() > kPartLimit)
+        if (bytes.size() > kPartCap)
         {
             if (getenv("WIEEN_DEBUG"))
                 fprintf(stderr, "wieen-compile: the part of %lu bytes is too big\n",
@@ -639,7 +686,7 @@ static bool split_script(const std::string& source, lua_CompileOptions options,
                 piece = text.substr(partBegin, end - partBegin);
                 if (!compile_part(piece, options, keep_upstream, stopReturn, bytes, error))
                     return false;
-                if (bytes.size() > kPartLimit)
+                if (bytes.size() > kPartCap)
                 {
                     lua_CompileOptions plain = options;
                     plain.debugLevel = 0;
@@ -652,7 +699,7 @@ static bool split_script(const std::string& source, lua_CompileOptions options,
                     }
                 }
             }
-            if (bytes.size() > kPartLimit)
+            if (bytes.size() > kPartCap)
             {
                 if (getenv("WIEEN_DEBUG"))
                     fprintf(stderr, "wieen-compile: the statement is too big:\n---8<---\n%s\n---8<---\n",
@@ -828,9 +875,10 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    if (bytes.size() <= kPartLimit)
+    if (bytes.size() <= kPartCap)
     {
-        fwrite(bytes.data(), 1, bytes.size(), stdout);
+        std::string out = with_container(bytes);
+        fwrite(out.data(), 1, out.size(), stdout);
         return 0;
     }
 
@@ -856,21 +904,16 @@ int main(int argc, char** argv)
             fprintf(stderr, "wieen-compile: %s\n", error.c_str());
             return 1;
         }
-        if (dispatcher.size() > kPartLimit)
-        {
-            lua_CompileOptions plain = options;
-            plain.debugLevel = 0;
-            std::string smaller;
-            if (compile_source(kLoadstringDispatcher, plain, keep_upstream,
-                               smaller, error))
-                dispatcher = smaller;
-        }
-        if (dispatcher.size() > kPartLimit)
+        if (dispatcher.size() > kPartCap)
         {
             fprintf(stderr, "wieen-compile: the loadstring dispatcher is "
                             "too big for the loader of the client\n");
             return 1;
         }
+
+        for (std::string& part : parts)
+            part = with_container(part);
+        dispatcher = with_container(dispatcher);
 
         std::string framed = frame_loadstring(dispatcher, parts);
         fwrite(framed.data(), 1, framed.size(), stdout);
@@ -887,6 +930,9 @@ int main(int argc, char** argv)
         fprintf(stderr, "wieen-compile: cannot split the script: %s\n", error.c_str());
         return 1;
     }
+
+    for (std::string& part : parts)
+        part = with_container(part);
 
     std::string framed = frame_parts(parts);
     fwrite(framed.data(), 1, framed.size(), stdout);

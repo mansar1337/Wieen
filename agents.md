@@ -11,7 +11,7 @@ Wieen — инжектор Luau в клиент Roblox, запущенный п�
 Агент грузится в процесс клиента, находит состояние Luau-VM и выполняет
 в нём скрипты, с доступом к игровым объектам.
 
-Репозиторий: <https://github.com/mansar1337/Wieen>. Ветка `master`.
+Ветка `master`.
 
 Документация: `README.md` (как пользоваться), `docs/status.md` (что
 исследовано), `docs/architecture.md` (устройство), `docs/reversing.md`

@@ -36,6 +36,7 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <sys/syscall.h>
+#include <sys/prctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -53,7 +54,15 @@
 #define LOG_FILE_NAME "agent.log"
 #define SOCKET_FILE_NAME "wieen.sock"
 
-#define MAX_MESSAGE (64 * 1024)
+/*
+ * The largest message of the socket.  A script travels as a container
+ * of its bytecode, and one of a megabyte is normal once the client is
+ * used for something like Infinite Yield, so the cap is well above the
+ * part cap of the compiler.  The buffers are static and only the bytes
+ * of a message are ever touched, so the size costs address space, not
+ * memory.
+ */
+#define MAX_MESSAGE (16 * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* the Luau API we drive inside the client                            */
@@ -298,6 +307,19 @@ static int page_is_mapped(const void* p)
 }
 
 /*
+ * A field is lent as a capability set only when it looks like one.  The
+ * context and the thread keep other things at the same offsets, and a
+ * pointer that is overwritten with ~0 makes the client crash instead of
+ * passing a check.  A value that points at mapped memory is a pointer,
+ * not a set: the masks of the client (0x3e100000000, 0x303fffffffffff0b)
+ * point nowhere.
+ */
+static int looks_like_caps(unsigned long long v)
+{
+    return v == 0 || !page_is_mapped((void*)v);
+}
+
+/*
  * The checker of the client is shared by every script of the game and its
  * cached mask is rewritten by whichever script asks next.  A single lend
  * before the call therefore races with the client's own scripts, and the
@@ -311,15 +333,60 @@ static unsigned long long g_guard_mask;
 static void* volatile g_guard_lazy;
 static unsigned long long g_guard_lazy_val;
 
+/*
+ * The engine recomputes its masks while a script runs.  The guard keeps
+ * every field the call was lent at its lent value for the whole call, not
+ * only the cache of the checker.
+ */
+#define GUARD_SLOTS 24
+static unsigned long long* g_guard_ptr[GUARD_SLOTS];
+static unsigned long long g_guard_val[GUARD_SLOTS];
+static int g_guard_n;
+
+static void guard_add(void* addr, unsigned long long value)
+{
+    if (!addr || g_guard_n >= GUARD_SLOTS)
+        return;
+    g_guard_ptr[g_guard_n] = (unsigned long long*)addr;
+    g_guard_val[g_guard_n] = value;
+    g_guard_n++;
+}
+
 static void* guard_loop(void* arg)
 {
     (void)arg;
+    const int verbose = env_flag("WIEEN_SANDBOXLOG");
+    static unsigned char seen[GUARD_SLOTS];
+    static unsigned long long last[GUARD_SLOTS];
+    static int logged[GUARD_SLOTS];
     while (g_guard_on)
     {
-        if (g_guard_at && *g_guard_at != g_guard_mask)
-            *g_guard_at = g_guard_mask;
-        if (g_guard_lazy && *(unsigned long long*)g_guard_lazy != g_guard_lazy_val)
-            *(unsigned long long*)g_guard_lazy = g_guard_lazy_val;
+        for (int i = 0; i < g_guard_n; i++)
+        {
+            unsigned long long v = *g_guard_ptr[i];
+            if (v != g_guard_val[i])
+            {
+                /*
+                 * Someone of the client wrote the field while the call
+                 * runs.  That is the race the guard exists for, and the
+                 * value that was written tells which set the client
+                 * wanted; log a few of them per field.
+                 */
+                if (verbose && (!seen[i] || last[i] != v))
+                {
+                    seen[i] = 1;
+                    last[i] = v;
+                    if (logged[i] < 8)
+                    {
+                        logged[i]++;
+                        wieen_log("wieen: guard: %p had %#llx, the lent "
+                                  "value is %#llx\n", (void*)g_guard_ptr[i],
+                                  v, g_guard_val[i]);
+                    }
+                }
+                *g_guard_ptr[i] = g_guard_val[i];
+            }
+        }
         __asm__ __volatile__("pause");
     }
     return 0;
@@ -359,6 +426,73 @@ static void dump_state_fields(void* L)
                 if (page_is_mapped((char*)env + r))
                     wieen_log("wieen:   env+%03x = %#llx\n", r,
                               *(unsigned long long*)((char*)env + r));
+    }
+}
+
+/*
+ * The instance access check (0x22ea488) does not read the mask of the
+ * state: it walks the call frames from ci down to base, takes the first
+ * frame that looks like a Lua closure, and ANDs two masks:
+ *
+ *   allowed = (checker[+0x30] | ~0xff) & ([L+0x20][+0x80] & [env+0x70])
+ *
+ * WIEEN_SANDBOXLOG prints both factors and the walk, so a missing bit can
+ * be traced to the field that lacks it.
+ */
+static void dump_sandbox_masks(void* L)
+{
+    void* ctx = *(void**)((char*)L + LSTATE_CTX);
+    if (ctx && page_is_mapped((char*)ctx + 0x80))
+        wieen_log("wieen: [L+0x20]+0x80 = %#llx\n",
+                  *(unsigned long long*)((char*)ctx + 0x80));
+    /*
+     * The chunk that is about to run: its closure is on the top of the
+     * stack, and the check will read the mask of its environment.
+     */
+    char* top = *(char**)((char*)L + LSTATE_TOP);
+    if (top && page_is_mapped(top - 16))
+    {
+        char* tv = top - 16;
+        int tag = *(int*)(tv + 0xc);
+        void* obj = *(void**)tv;
+        wieen_log("wieen: chunk tv %p tag %d object %p\n", tv, tag, obj);
+        if (tag == 8 && obj && page_is_mapped(obj))
+        {
+            void* env = *(void**)((char*)obj + 0x18);
+            if (env && page_is_mapped((char*)env + 0x190))
+                wieen_log("wieen: chunk env %p mask@0x70 %#llx mask@0x190 "
+                          "%#llx\n", env,
+                          *(unsigned long long*)((char*)env + 0x70),
+                          *(unsigned long long*)((char*)env + 0x190));
+        }
+    }
+    char* ci = *(char**)((char*)L + LSTATE_CI);
+    char* base = *(char**)((char*)L + 0x18);
+    for (int k = 0; k < 8 && ci && ci > base && page_is_mapped(ci);
+         k++, ci -= 0x30)
+    {
+        char* tv = *(char**)(ci + 8);
+        wieen_log("wieen: frame %d ci %p tv %p\n", k, ci, tv);
+        if (!tv || !page_is_mapped(tv))
+            continue;
+        int tag = *(int*)(tv + 0xc);
+        if (tag != 8)
+        {
+            wieen_log("wieen:   tag %d, not a closure\n", tag);
+            continue;
+        }
+        void* obj = *(void**)tv;
+        if (!obj || !page_is_mapped(obj))
+            continue;
+        unsigned char b3 = *(unsigned char*)((char*)obj + 3);
+        wieen_log("wieen:   object %p byte3 %d\n", obj, b3);
+        if (b3)
+            continue;
+        void* env = *(void**)((char*)obj + 0x18);
+        if (!env || !page_is_mapped((char*)env + 0x70))
+            continue;
+        wieen_log("wieen:   env %p mask %#llx\n", env,
+                  *(unsigned long long*)((char*)env + 0x70));
     }
 }
 
@@ -853,6 +987,8 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             char** pbase = (char**)((char*)parent + LSTATE_BASE);
             wieen_log("wieen: the stack of the game: base %p top %p\n",
                       (void*)*pbase, (void*)*ptop);
+            if (env_flag("WIEEN_SANDBOXLOG"))
+                dump_sandbox_masks(parent);
 
             /*
              * The thread of the game runs our chunk with the rights it has
@@ -875,13 +1011,13 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                 wieen_log("wieen: the mask of the game is lent as %#x (was "
                           "%#x)\n", *caps, savedcaps);
             }
-            else if (have_file_mask)
-            {
-                *caps = (unsigned int)file_mask;
-                lent = 1;
-                wieen_log("wieen: the mask of the game is lent as %#x (was "
-                          "%#x, from caps.txt)\n", *caps, savedcaps);
-            }
+            /*
+             * caps.txt used to be lent here as well, but the field at
+             * ctx+0x0c turned out to be a small counter of the client,
+             * not the mask of the sandbox: it is written with 0x3, 0x6
+             * and the like while scripts run.  Only an explicit request
+             * touches it now.
+             */
             else
             {
                 /*
@@ -1065,6 +1201,20 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                 wieen_log("wieen: the env of the chunk: closure %p env %p "
                           "mask %p\n", closure, env, penv ? *penv : 0);
             const char* ecaps = getenv("WIEEN_ENVCAPS");
+            /*
+             * The chunk creates functions that live on after the call:
+             * the callbacks of the GUI it builds.  When such a callback
+             * runs, the client asks the access check again, and the check
+             * reads the mask of the environment of the closure - the same
+             * environment the chunk was loaded with.  Giving the mask back
+             * after the call would therefore close every callback.  The
+             * lend is kept for the life of the process; WIEEN_ENVKEEP=0
+             * restores the old behaviour.
+             */
+            const char* keepenv = getenv("WIEEN_ENVKEEP");
+            int keep_env = !keepenv || strcmp(keepenv, "0") != 0;
+            const char* keepdef = getenv("WIEEN_DEFKEEP");
+            int keep_def = !keepdef || strcmp(keepdef, "0") != 0;
             if (penv)
             {
                 /*
@@ -1086,29 +1236,77 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
              * "The current thread cannot access 'X'" reads [env+0x190]
              * (see 0x22ea744), while the getter/setter path asks the
              * accessor 0x22ea488 for [env+0x70] & [[L+0x20]+0x80].  Both
-             * are lent here, the pointer is given back afterwards.
+             * are lent here; the environment outlives the call (the
+             * closures of the chunk stay in the game), so the lends stay
+             * too unless WIEEN_ENVKEEP=0.
              */
             unsigned long long* penv190 = 0;
             unsigned long long saved190 = 0;
             int lent190 = 0;
-            if (env && page_is_mapped((char*)env + 0x190))
+            if (env && page_is_mapped((char*)env + 0x190) &&
+                looks_like_caps(*(unsigned long long*)((char*)env + 0x190)))
             {
                 penv190 = (unsigned long long*)((char*)env + 0x190);
-                if (*penv190 < 0x1000000000000ULL)
-                {
-                    saved190 = *penv190;
-                    *penv190 = ~0ULL;
-                    lent190 = 1;
-                    wieen_log("wieen: the mask of the env at +0x190 is lent "
-                              "as %#llx (was %#llx)\n", *penv190, saved190);
-                }
-                else
-                    wieen_log("wieen: the field env+0x190 is %#llx, not a "
-                              "mask, left alone\n", *penv190);
+                saved190 = *penv190;
+                *penv190 = ~0ULL;
+                lent190 = 1;
+                wieen_log("wieen: the mask of the env at +0x190 is lent "
+                          "as %#llx (was %#llx)\n", *penv190, saved190);
+            }
+
+            /*
+             * A Lua thread keeps a set of capabilities of its own at
+             * +0x100 (see 0x28d2b50, 0x28d5ecf): a u64 whose bit 34 is
+             * the capability Players, bit 26 CSG.  A chunk loaded by the
+             * agent is not a script of the client, so the field of the
+             * thread is lent the full set for the call.
+             */
+            unsigned long long* p100 = 0;
+            unsigned long long saved100 = 0;
+            int lent100 = 0;
+            if (page_is_mapped((char*)parent + 0x100) &&
+                looks_like_caps(*(unsigned long long*)((char*)parent + 0x100)))
+            {
+                p100 = (unsigned long long*)((char*)parent + 0x100);
+                if (env_flag("WIEEN_SANDBOXLOG"))
+                    wieen_log("wieen: the caps of the thread at +0x100 are "
+                              "%#llx\n", *p100);
+                saved100 = *p100;
+                *p100 = ~0ULL;
+                lent100 = 1;
+                wieen_log("wieen: the caps of the thread are lent as "
+                          "%#llx (was %#llx)\n", *p100, saved100);
+            }
+
+            /*
+             * When no frame of the chunk is recognised, 0x2299e5d answers
+             * with the default mask at 0x703eb90 instead of the mask of an
+             * environment.  That default is the one of an ordinary script
+             * of the game and does not carry Players, so it is lent too.
+             */
+            unsigned long long* pdef = 0;
+            unsigned long long saveddef = 0;
+            int lentdef = 0;
+            if (page_is_mapped((char*)g_base + 0x703eb90UL))
+            {
+                pdef = (unsigned long long*)(g_base + 0x703eb90UL);
+                saveddef = *pdef;
+                *pdef = ~0ULL;
+                lentdef = 1;
+                wieen_log("wieen: the default mask is lent as %#llx (was "
+                          "%#llx)\n", *pdef, saveddef);
             }
 
             unsigned long long* pchk = 0;
             unsigned long long savedchk = 0;
+            /*
+             * The client hands out several guard singletons by index.  The
+             * accessor and the reader use index 1, but a method call may
+             * take another one, so every index that answers is lent.
+             */
+            void* chkall[6] = {0};
+            unsigned long long chksaved[6] = {0};
+            int chkcount = 0;
             /*
              * The checker singletons are global: they cache the allowed
              * mask of the thread that asked first (+0x30) and reuse it
@@ -1125,21 +1323,34 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                 typedef void* (*fn_single)(void*, int);
                 fn_single single = (fn_single)(g_base + 0x2992ee0UL);
                 refresh_maps();
-                void* chk = single((void*)(g_base + 0x6f85d50UL), 1);
-                chkobj = chk;
-                if (chk && map_contains((char*)chk + 0x38))
+                refresh_maps();
+                for (int idx = 0; idx < 6; idx++)
                 {
-                    pchk = (unsigned long long*)((char*)chk + 0x30);
-                    savedchk = *pchk;
-                    *pchk = (ckcaps && *ckcaps && strcmp(ckcaps, "0") != 0)
-                                ? strtoull(ckcaps, 0, 0)
-                                : ~0ULL;
-                    wieen_log("wieen: the caps of the checker are lent as "
-                              "%#llx (was %#llx)\n", *pchk, savedchk);
+                    void* chk = single((void*)(g_base + 0x6f85d50UL), idx);
+                    if (!chk || !map_contains((char*)chk + 0x38))
+                        continue;
+                    chkall[chkcount] = chk;
+                    unsigned long long* pc =
+                        (unsigned long long*)((char*)chk + 0x30);
+                    chksaved[chkcount] = *pc;
+                    *pc = (ckcaps && *ckcaps && strcmp(ckcaps, "0") != 0)
+                              ? strtoull(ckcaps, 0, 0)
+                              : ~0ULL;
+                    *(unsigned long long*)((char*)chk + 0x38) = 0;
+                    wieen_log("wieen: checker %d at %p, its caps are lent as "
+                              "%#llx (was %#llx)\n", idx, chk, *pc,
+                              chksaved[chkcount]);
+                    chkcount++;
+                }
+                if (chkcount)
+                {
+                    chkobj = chkall[0];
+                    pchk = (unsigned long long*)((char*)chkall[0] + 0x30);
+                    savedchk = chksaved[0];
                 }
                 else
-                    wieen_log("wieen: the checker is %p, the caps are not "
-                              "lent\n", chk);
+                    wieen_log("wieen: no checker answers, the caps are not "
+                              "lent\n");
             }
 
             pthread_t guard;
@@ -1147,14 +1358,28 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
             const char* guardenv = getenv("WIEEN_GUARD");
             if (pchk && (!guardenv || strcmp(guardenv, "0") != 0))
             {
-                g_guard_at = pchk;
-                g_guard_mask = *pchk;
-                g_guard_lazy = chkobj ? (char*)chkobj + 0x38 : 0;
-                g_guard_lazy_val = 0;
+                g_guard_n = 0;
+                for (int idx = 0; idx < chkcount; idx++)
+                {
+                    guard_add((char*)chkall[idx] + 0x30, ~0ULL);
+                    guard_add((char*)chkall[idx] + 0x38, 0);
+                }
+                if (lent100)
+                    guard_add(p100, *p100);
+                if (lent190)
+                    guard_add(penv190, *penv190);
+                if (lenved)
+                    guard_add(penv, (unsigned long long)&g_env_mask);
+                if (lentdef)
+                    guard_add(pdef, ~0ULL);
+                if (lent64)
+                    guard_add(caps64, *caps64);
+                if (lent)
+                    guard_add(caps, *caps);
                 g_guard_on = 1;
                 guarding = pthread_create(&guard, 0, guard_loop, 0) == 0;
                 if (guarding)
-                    wieen_log("wieen: the guard holds the checker\n");
+                    wieen_log("wieen: the guard holds %d fields\n", g_guard_n);
             }
             int rc = wieen_pcall(parent, 0, 1, 0);
             if (guarding)
@@ -1163,24 +1388,46 @@ static int run_one(void* parent, const unsigned char* chunk, size_t bclen,
                 pthread_join(guard, 0);
             }
 
-            if (pchk)
+            if (lentdef && !keep_def)
             {
-                *pchk = savedchk;
-                wieen_log("wieen: the caps of the checker are %#llx again\n",
-                          savedchk);
+                *pdef = saveddef;
+                wieen_log("wieen: the default mask is %#llx again\n",
+                          saveddef);
             }
-            if (lent190)
+            if (lentdef && keep_def)
+                wieen_log("wieen: the default mask stays lent for the "
+                          "callbacks\n");
+            for (int idx = 0; idx < chkcount; idx++)
+            {
+                *(unsigned long long*)((char*)chkall[idx] + 0x30) =
+                    chksaved[idx];
+                *(unsigned long long*)((char*)chkall[idx] + 0x38) = 0;
+                wieen_log("wieen: the caps of checker %d are %#llx again\n",
+                          idx, chksaved[idx]);
+            }
+            if (pchk)
+                (void)savedchk;
+            if (lent100)
+            {
+                *p100 = saved100;
+                wieen_log("wieen: the caps of the thread are %#llx again\n",
+                          saved100);
+            }
+            if (lent190 && !keep_env)
             {
                 *penv190 = saved190;
                 wieen_log("wieen: the mask of the env at +0x190 is %#llx "
                           "again\n", saved190);
             }
-            if (lenved)
+            if (lenved && !keep_env)
             {
                 *penv = savedenv;
                 wieen_log("wieen: the caps of the env are %p again\n",
                           savedenv);
             }
+            if (keep_env && (lent190 || lenved))
+                wieen_log("wieen: the caps of the env stay lent for the "
+                          "callbacks of the chunk\n");
 
             if (lent64)
             {
@@ -3326,6 +3573,16 @@ __attribute__((constructor)) static void wieen_init(void)
      */
     if (env_flag("WIEEN_OFF"))
         return;
+    /*
+     * A debugger is a parent of nothing here, and the kernel lets one
+     * attach to a process only when it is.  The flag opens the process
+     * to any tracer for the session that asks for it.
+     */
+    if (env_flag("WIEEN_PTRACE"))
+    {
+        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+        wieen_log("wieen: the process is open to a tracer\n");
+    }
     wieen_log("\n=== wieen agent (pid %d) ===\n", (int)getpid());
     wieen_log("wieen: the hook is the pre-resume callback of the state of Luau\n");
     pthread_t thread;
